@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import jwt
@@ -5,8 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from freqtrade.rpc.api_server import api_trx
-from freqtrade.rpc.api_server.app import create_app, load_config
+from freqtrade.rpc.api_server.app import create_app, load_config, main
 from freqtrade.strategy.trx_phase1.timerange import TimeRange
+from tests.strategy.trx_phase1.test_phase1 import candles, research
 
 
 @pytest.fixture
@@ -99,6 +101,68 @@ def test_config_environment_overrides_and_does_not_load_exchange_credentials(tmp
 def test_invalid_server_configuration_is_rejected(config, change):
     with pytest.raises(ValueError):
         create_app({**config, **change})
+
+
+def test_existing_production_entrypoint_keeps_user_directory_recovery_and_logging(
+    config, tmp_path, mocker
+):
+    config.update(
+        user_data_dir=None,
+        datadir=None,
+        trx_phase1={"existing_live_only": True, "auto_resume_live": True},
+    )
+    path = tmp_path / "cloud.json"
+    path.write_text(json.dumps(config))
+    userdir = tmp_path / "account-data"
+    logfile = userdir / "logs/webserver.cloud.log"
+    run = mocker.patch("freqtrade.rpc.api_server.app.uvicorn.run")
+    main(["webserver", "--config", str(path), "--userdir", str(userdir), "--logfile", str(logfile)])
+    run.assert_called_once()
+    app = run.call_args.args[0]
+    assert app.state.config["user_data_dir"] == userdir
+    assert app.state.config["datadir"] == userdir / "data/bitget"
+    assert app.state.config["trx_phase1"]["auto_resume_live"]
+    assert run.call_args.kwargs["workers"] == 1
+    handler = run.call_args.kwargs["log_config"]["handlers"]["trx_file"]
+    assert handler["filename"] == str(logfile) and handler["maxBytes"] > 0
+    assert handler["backupCount"] > 0
+
+
+def test_old_command_name_does_not_restore_generic_trading_commands():
+    with pytest.raises(SystemExit) as exc:
+        main(["trade"])
+    assert exc.value.code == 2
+
+
+def test_frontend_research_metadata_replay_diagnostics_and_export_use_real_http(
+    config, tmp_path, monkeypatch
+):
+    data = tmp_path / "data/bitget"
+    data.mkdir(parents=True)
+    candles(120).to_feather(data / "TRX_USDT-1m.feather")
+    monkeypatch.setattr(api_trx, "_jobs", {})
+    with TestClient(create_app(config)) as client:
+        credentials = config["api_server"]
+        client.auth = (credentials["username"], credentials["password"])
+        meta = client.get("/api/v1/trx/config")
+        assert meta.status_code == 200 and meta.json()["data"]["rows"] == 120
+        assert "treasury" not in meta.json()
+        response = client.post(
+            "/api/v1/trx/backtest",
+            json={"parameters": research().model_dump(), "collect_diagnostics": True},
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+        job = client.get("/api/v1/trx/jobs/" + run_id).json()
+        assert job["status"] == "success", job
+        path = "/api/v1/trx/results/" + run_id
+        result = client.get(path)
+        assert result.status_code == 200 and result.json()["run_id"] == run_id
+        assert client.get(path + "/diagnostics").json()["collected"]
+        records = client.get(path + "/diagnostics/samples", params={"limit": 5})
+        assert records.status_code == 200 and records.json()["rows"]
+        exported = client.get(path + "/export")
+        assert exported.status_code == 200 and exported.content[:2] == b"PK"
 
 
 @pytest.mark.parametrize(

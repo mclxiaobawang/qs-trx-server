@@ -35,7 +35,25 @@ cp config_examples/server.example.json user_data/config.trx.json
 docker compose up --build -d
 ```
 
-Compose 只在宿主机 `127.0.0.1:8080` 发布端口，容器内存及 memory+swap 上限均为 512 MiB。已有线上实例不会因本地代码清理自动更新；实际部署需使用新的 `trx-server` 入口。
+Compose 提供交易 API，只在宿主机 `127.0.0.1:8080` 发布端口，容器内存及 memory+swap 上限均为 512 MiB。
+
+现有线上容器的入口保持兼容：
+
+```bash
+freqtrade webserver --config /app/user_data/config.cloud-web.json --userdir /app/user_data --logfile /app/user_data/logs/webserver.cloud.log
+```
+
+`freqtrade` 仅是 TRX 服务的兼容命令名，接受 `webserver`；日志按大小轮换。已有配置中的 `existing_live_only`、`auto_resume_live`、登录凭证、数据目录与冻结账户继续沿用，不重新准备首仓。
+
+完整前端使用三个独立服务。升级时保留现有反向代理的转发规则，不要把只读接口转给交易 API：
+
+| 接口 | 服务及端口 |
+| --- | --- |
+| `/api/v1/trx/live/view`、`/api/v1/trx/live/ops` | 独立监控，8091 |
+| `/api/v1/trx/live/history` | 独立历史，8090 |
+| 其他 `/api/v1/*` | TRX 交易及研究 API，8080 |
+
+三个服务使用同一网站 `username` 和 `jwt_secret_key`。监控继续以 `PYTHONPATH=/app/freqtrade/strategy python -m trx_phase1.live_ops_app` 读取 `/config/observer.json`；历史服务继续以 `python /app/freqtrade/strategy/trx_phase1/live_history_app.py --config /config/history.json` 启动。账户目录在两种只读服务中保持只读挂载，独立状态与历史归档使用各自目录。
 
 ## 研究与运维
 

@@ -347,23 +347,6 @@ def research_config(config=Depends(get_config)):
         "comparisons": comparison_groups(results)[:20],
         "studies": list_studies(Path(config["user_data_dir"]) / "trx_phase1/studies"),
         "experiments": list_experiments(config),
-        "treasury": {
-            "real_account_active": False,
-            "implemented": [
-                "verified product tiers",
-                "locked asset accounting",
-                "redemption arrival",
-                "credited interest",
-                "net USDGO switch forecast",
-                "Bitget Classic Savings adapter",
-            ],
-            "pending_verification": [
-                "account/API permissions",
-                "TRX/USDT/USDGO product eligibility and quotas",
-                "actual interest and redemption rules",
-                "USDGO executable FX and historical product data",
-            ],
-        },
     }
 
 

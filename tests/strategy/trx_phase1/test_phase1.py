@@ -13,12 +13,6 @@ from freqtrade.strategy.trx_phase1.engine import Engine
 from freqtrade.strategy.trx_phase1.ledger import Ledger, StateStore
 from freqtrade.strategy.trx_phase1.replay import replay
 from freqtrade.strategy.trx_phase1.runtime import PaperRuntime
-from freqtrade.strategy.trx_phase1.treasury import (
-    BitgetSavings,
-    ProductTerms,
-    Treasury,
-    cash_switch_quote,
-)
 
 
 def candles(count=600):
@@ -406,67 +400,3 @@ def test_end_positions_are_not_force_liquidated():
 def test_invalid_research_configuration(parameters):
     with pytest.raises(ValidationError):
         ResearchConfig(**parameters)
-
-
-def terms(coin="USDT", rate=0.05):
-    return ProductTerms("verified-fixture", coin, True, 1, 10000, 10000, 0, 0, ((10000, rate),))
-
-
-def test_earn_locks_do_not_double_count_and_arrival_is_required():
-    engine = Engine(research())
-    treasury = Treasury(engine)
-    treasury.lock_subscription("sub", terms(), 500)
-    assert engine.book.equity(1) == 1000
-    assert engine.book.free_cash == 500
-    treasury.request_redemption("r", "USDT", 100)
-    with pytest.raises(ValueError, match="arrival"):
-        treasury.confirm_arrival("r", "arr", 100)
-    assert engine.book.free_cash == 500
-    treasury.confirm_arrival("r", "arr", 100, wallet_verified=True)
-    treasury.confirm_arrival("r", "arr", 100, wallet_verified=True)
-    assert engine.book.free_cash == 600
-    assert engine.book.equity(1) == 1000
-
-
-def test_principal_opportunity_interrupts_treasury_and_interest_is_credited_once():
-    engine = Engine(research(startup="small_buy"))
-    treasury = Treasury(engine)
-    engine.on_close(60000, 1, 0)
-    with pytest.raises(ValueError, match="priority"):
-        treasury.lock_subscription("sub", terms(), 500)
-    rows = [
-        {
-            "orderType": "pay_interest",
-            "orderId": "unique",
-            "settleCoinName": "TRX",
-            "amount": "3",
-            "ts": "60000",
-        }
-    ]
-    treasury.import_credited_interest(rows)
-    treasury.import_credited_interest(rows)
-    assert engine.book.interest_trx == 3
-    assert engine.book.deployable == 1000
-
-
-def test_cash_switch_uses_tiers_spread_and_opportunity_cost():
-    proposal = cash_switch_quote(
-        1000, 24, 0.999, 1.001, 0.001, terms(rate=0.01), terms("USDGO", 0.05)
-    )
-    assert proposal["expected_net_benefit"] < 0 and not proposal["eligible"]
-    high = cash_switch_quote(
-        1000, 24 * 30, 0.999, 1.001, 0.001, terms(rate=0.01), terms("USDGO", 0.1)
-    )
-    assert high["eligible"]
-    assert not cash_switch_quote(1000, 24, 0.95, 0.96, 0.001, terms(), terms("USDGO"))["eligible"]
-    assert not cash_switch_quote(
-        1000, 24, 1, 1, 0, terms(), terms("USDGO"), principal_pending=True
-    )["eligible"]
-
-
-def test_real_earn_adapter_cannot_write_without_activation():
-    adapter = BitgetSavings(None)
-    with pytest.raises(PermissionError):
-        adapter.subscribe("product", 100)
-    with pytest.raises(PermissionError):
-        adapter.redeem("product", "asset", 100)

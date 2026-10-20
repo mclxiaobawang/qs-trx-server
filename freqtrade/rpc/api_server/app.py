@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from pathlib import Path
 
 import uvicorn
@@ -39,9 +40,9 @@ def create_app(config):
         raise ValueError("TRX backend requires Bitget spot")
     config["exchange"] = {"name": "bitget"}
     config["trading_mode"] = "spot"
-    config["user_data_dir"] = Path(config.get("user_data_dir", "user_data")).resolve()
+    config["user_data_dir"] = Path(config.get("user_data_dir") or "user_data").resolve()
     config["datadir"] = Path(
-        config.get("datadir", config["user_data_dir"] / "data/bitget")
+        config.get("datadir") or config["user_data_dir"] / "data/bitget"
     ).resolve()
 
     @asynccontextmanager
@@ -90,19 +91,39 @@ def create_app(config):
     return app
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Run the TRX strategy backend")
+    # Existing production containers invoke this exact webserver command.
+    parser.add_argument("command", nargs="?", choices=["webserver"])
     parser.add_argument("--config", type=Path, default=Path("user_data/config.trx.json"))
-    args = parser.parse_args()
+    parser.add_argument("--userdir", type=Path)
+    parser.add_argument("--logfile", type=Path)
+    args = parser.parse_args(argv)
     config = load_config(args.config)
+    if args.userdir is not None:
+        config["user_data_dir"] = args.userdir
     app = create_app(config)
     api = config["api_server"]
+    log_config = deepcopy(uvicorn.config.LOGGING_CONFIG)
+    if args.logfile is not None:
+        args.logfile.parent.mkdir(parents=True, exist_ok=True)
+        log_config["handlers"]["trx_file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(args.logfile),
+            "formatter": "default",
+            "maxBytes": 10 * 1024 * 1024,
+            "backupCount": 10,
+        }
+        for name in ("uvicorn", "uvicorn.access"):
+            log_config["loggers"][name]["handlers"].append("trx_file")
+        log_config["root"] = {"handlers": ["default", "trx_file"], "level": "INFO"}
     uvicorn.run(
         app,
         host=api.get("listen_ip_address", "127.0.0.1"),
         port=api.get("listen_port", 8080),
         workers=1,
         limit_concurrency=api.get("limit_concurrency", 8),
+        log_config=log_config,
     )
 
 

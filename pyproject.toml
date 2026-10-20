@@ -30,6 +30,7 @@ Repository = "https://github.com/Quantitative-Strategies/qs-trx-server"
 [project.scripts]
 trx-server = "freqtrade.rpc.api_server.app:main"
 trx-replay = "freqtrade.strategy.trx_phase1.__main__:main"
+freqtrade = "freqtrade.rpc.api_server.app:main"
 
 [tool.setuptools.packages.find]
 include = ["freqtrade*"]
