@@ -1,0 +1,38 @@
+# Local credentials, account ledgers and generated evidence
+/user_data/
+/output/
+/tmp/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+
+# Python and editor artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
+.codex/
+
+# Separately built frontend assets
+/freqtrade/rpc/api_server/ui/

@@ -1,0 +1,17 @@
+services:
+  trx-server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./user_data:/app/user_data
+      - ./user_data/config.trx.json:/app/config/server.json:ro
+    environment:
+      TRX_API_USERNAME: ${TRX_API_USERNAME:?Set TRX_API_USERNAME}
+      TRX_API_PASSWORD: ${TRX_API_PASSWORD:?Set TRX_API_PASSWORD}
+      TRX_API_JWT_SECRET_KEY: ${TRX_API_JWT_SECRET_KEY:?Set TRX_API_JWT_SECRET_KEY}
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
+    init: true

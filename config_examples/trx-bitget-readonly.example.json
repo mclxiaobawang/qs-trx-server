@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "account_type": "classic",
+  "include_earn": true,
+  "history_days": 7,
+  "api_key": "",
+  "secret_key": "",
+  "passphrase": ""
+}

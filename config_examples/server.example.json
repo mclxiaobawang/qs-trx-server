@@ -1,0 +1,19 @@
+{
+  "user_data_dir": "user_data",
+  "datadir": "user_data/data/bitget",
+  "exchange": {"name": "bitget"},
+  "trading_mode": "spot",
+  "api_server": {
+    "listen_ip_address": "0.0.0.0",
+    "listen_port": 8080,
+    "username": "",
+    "password": "",
+    "jwt_secret_key": "",
+    "CORS_origins": [],
+    "enable_openapi": false
+  },
+  "trx_phase1": {
+    "existing_live_only": true,
+    "auto_resume_live": false
+  }
+}
