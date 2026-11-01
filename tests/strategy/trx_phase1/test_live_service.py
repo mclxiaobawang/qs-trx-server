@@ -66,6 +66,37 @@ def test_page_status_does_not_construct_broker_allocate_or_start(service):
     assert broker.state()["writes"] == []
 
 
+def test_bgb_enabled_preflight_does_not_allocate_or_submit(service):
+    svc, broker, _, reads, _ = service
+    broker.bgb_deduction = "on"
+    with pytest.raises(ExecutionError, match="disable_bgb_deduction_before_start"):
+        svc.prepare(setup())
+    assert not (svc.root / "live_execution").exists()
+    assert svc.load() is None and reads == [False]
+    assert broker.state()["writes"] == []
+
+
+def test_start_rechecks_bgb_switch_on_writer_before_worker_start(service, monkeypatch):
+    svc, broker, _, _, _ = service
+    checked = svc.prepare(setup())
+    before = svc.runtime.execution.status()
+    original = svc.broker_factory
+
+    def switched(writes):
+        value = original(writes)
+        value.bgb_deduction = "on" if writes else "off"
+        return value
+
+    svc.broker_factory = switched
+    started = MagicMock()
+    monkeypatch.setattr(LiveStrategy, "start", started)
+    with pytest.raises(ExecutionError, match="disable_bgb_deduction_before_start"):
+        svc.start(checked["prepared"]["review_hash"])
+    started.assert_not_called()
+    assert svc.runtime.execution.status()["book"] == before["book"]
+    assert broker.state()["writes"] == []
+
+
 def test_contribution_preview_and_confirm_use_reader_and_preserve_strategy(service):
     from freqtrade.strategy.trx_phase1.ledger import Ledger, money
     from tests.strategy.trx_phase1.test_income_allocation import approve

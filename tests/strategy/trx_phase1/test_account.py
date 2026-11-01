@@ -442,6 +442,24 @@ def test_savings_pagination_keeps_interest_separate_and_marks_creation_coverage(
     assert client.privateEarnGetV2EarnSavingsAssets.call_args.args[0]["idLessThan"] == "last"
 
 
+def test_registration_enables_all_age_savings_reconciliation_without_credential_changes(account):
+    service, client, path, _, _, _ = account
+    previous = path.read_bytes()
+    registered = 1800000000000 - 200 * 86400000
+    client.privateSpotGetV2SpotAccountInfo.return_value = response(
+        {"userId": "123456789", "regisTime": str(registered)}
+    )
+    client.privateEarnGetV2EarnAccountAssets.return_value = response(
+        [{"coin": c, "amount": "0"} for c in ("USDT", "USDGO", "TRX")]
+    )
+    result = service.refresh()
+    assert result["snapshot"]["account"]["registered_at"] == registered
+    assert result["snapshot"]["savings"]["full_account_holdings_verified"]
+    assert len(result["snapshot"]["savings"]["coverage"]["windows"]) == 3
+    assert not result["trading_enabled"] and not result["earn_write_enabled"]
+    assert path.read_bytes() == previous
+
+
 def test_duplicate_pagination_is_an_error_not_partial_asset_total(account):
     service, client, _, _, _, _ = account
     first = [savings_row(str(index)) for index in range(100)]

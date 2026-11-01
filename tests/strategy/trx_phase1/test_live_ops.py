@@ -55,6 +55,33 @@ def test_view_is_read_only_and_has_no_worker_or_curve_and_preserves_accounting(o
     assert not missing.exists()
 
 
+def test_unused_adopted_account_can_poll_without_market_fees_or_starting_trading(tmp_path):
+    from tests.strategy.trx_phase1.test_startup_basis import adopted
+
+    service, _, _ = adopted(tmp_path)
+    service.get_runtime(service.load())
+    source = service.root / "live_execution" / service.load()["account_id"]
+    original = {p.name: p.read_bytes() for p in source.glob("*.sqlite")}
+    view = LiveView(source, service.load()["account_id"], clock=service.clock)
+    first = view.view()
+    second = view.view()
+    assert (
+        first["runtime"]["performance"]
+        == second["runtime"]["performance"]
+        == {
+            "status": "not_started",
+            "started_at": None,
+            "basis": "actual_strategy_start_market_value",
+            "previous_adoption_is_performance_basis": False,
+        }
+    )
+    assert first["runtime"]["order_preview"]["buy"] is None
+    assert first["runtime"]["order_preview"]["sell"] is None
+    assert first["runtime"]["desired"] == "paused"
+    assert first["runtime"]["execution"]["orders"] == []
+    assert {p.name: p.read_bytes() for p in source.glob("*.sqlite")} == original
+
+
 def test_standalone_observer_has_no_trading_imports_and_matches_saved_account(observed):
     _, broker, view = observed
     before = {p.name: p.read_bytes() for p in view.source.glob("*.sqlite")}
@@ -91,6 +118,24 @@ def test_cgroup_memory_budget_is_finite_and_missing_metrics_are_safe(tmp_path):
     assert live_ops.memory_usage(tmp_path) == {"current": 850, "limit": 1000, "percent": 85}
     (tmp_path / "memory.max").write_text("max")
     assert live_ops.memory_usage(tmp_path) is None
+
+
+def test_host_metrics_bind_to_configured_container_and_still_reject_stale_or_wrong_data(tmp_path):
+    path = tmp_path / "trading-memory.json"
+    value = {
+        "container_name": "trx-new-api",
+        "checked_at": 100000,
+        "running": True,
+        "current": 100,
+        "limit": 1000,
+        "error": None,
+    }
+    path.write_text(json.dumps(value))
+    assert live_ops.trading_memory(path, 100000, container_name="trx-new-api")["percent"] == 10
+    assert live_ops.trading_memory(path, 100000) == {"available": False}
+    assert live_ops.trading_memory(path, 200001, container_name="trx-new-api") == {
+        "available": False
+    }
 
 
 def test_preview_accounts_for_fee_reserve_and_never_sells_retained_interest(observed):

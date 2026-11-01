@@ -143,6 +143,8 @@ class LiveHistory:
                 },
             )
 
+            return strategy, execution
+
     def seed(self, evidence):
         """Import saved event evidence, never a financial state or reconstructed trade."""
         if evidence["account_id"] != self.account_id:

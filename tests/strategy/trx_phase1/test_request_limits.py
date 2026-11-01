@@ -180,11 +180,33 @@ def test_post_429_never_retries_and_blocks_other_clients(limiter, mocker):
         RequestLimiter(limiter.path, clock=limiter.clock).acquire("candles", max_wait=0)
 
 
-def test_expired_write_permit_is_proven_unsent(limiter, mocker):
+def test_slow_durable_journal_admits_once_before_one_submission(limiter, mocker):
     transport = make_transport(limiter, mocker)
     path = "v2/earn/savings/subscribe"
     transport.reserve_write(path, 1)
     limiter.clock.sleep(0.1)
+    transport.call("POST", path, {"productId": "p", "periodType": "flexible", "amount": "1"})
+    assert transport.session.request.call_count == 1
+    with sqlite3.connect(limiter.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM admissions").fetchone()[0] == 1
+
+
+def test_original_write_deadline_still_prevents_submission(limiter, mocker):
+    transport = make_transport(limiter, mocker)
+    path = "v2/earn/savings/subscribe"
+    transport.reserve_write(path, 0.1)
+    limiter.clock.sleep(0.2)
+    with pytest.raises(WriteNotSent):
+        transport.call("POST", path, {"productId": "p", "periodType": "flexible", "amount": "1"})
+    transport.session.request.assert_not_called()
+
+
+def test_submission_never_bypasses_shared_cooldown(limiter, mocker):
+    transport = make_transport(limiter, mocker)
+    path = "v2/earn/savings/subscribe"
+    transport.reserve_write(path, 10)
+    limiter.clock.sleep(0.1)
+    limiter.limited({"Retry-After": "60"})
     with pytest.raises(WriteNotSent):
         transport.call("POST", path, {"productId": "p", "periodType": "flexible", "amount": "1"})
     transport.session.request.assert_not_called()

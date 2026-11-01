@@ -25,11 +25,13 @@ from freqtrade.strategy.trx_phase1.live_execution import digest
 from freqtrade.strategy.trx_phase1.live_funding import LiveFunding
 from freqtrade.strategy.trx_phase1.live_observation import observed_close
 from freqtrade.strategy.trx_phase1.price_position import DAY, OFFSET, build_price_reference
+from freqtrade.strategy.trx_phase1.reconciliation_wait import clear_verified_wait, pending_wait
 from freqtrade.strategy.trx_phase1.shadow_market import validate_quote
 
 
 TERMINAL = {"completed", "expired", "failed", "needs_review"}
 EVIDENCE_WAIT_CODES = {
+    "account_credit_wallet_evidence_required",
     "wallet_reconciliation_required",
     "owned_balance_not_spendable",
     "interest_holding_evidence_incomplete",
@@ -144,6 +146,10 @@ class LiveStrategy:
         self.store = LiveStrategyStore(execution.root / "strategy.sqlite")
         self.version, self.state = self.store.load("strategy")
         self.engine = Engine.restore(self.state["engine"]) if self.state else None
+        if self.state and self.state.get("range_policy"):
+            from freqtrade.strategy.trx_phase1.live_range_policy import restore_engine
+
+            self.engine = restore_engine(self.state, execution.state, execution.root)
         self.data = None
         self.reference = None
         self.reference_day = None
@@ -207,6 +213,7 @@ class LiveStrategy:
         return result
 
     def persist(self):
+        self.state["withdrawal_enabled"] = True
         self.state["engine"] = self.engine.state()
         self.state["events"] = self.state["events"][-500:]
         self.state["decisions"] = self.state["decisions"][-100:]
@@ -220,6 +227,9 @@ class LiveStrategy:
         observation = getattr(self.execution.broker, "savings_observation", None)
         if isinstance(observation, dict):
             self.state["savings_observation"] = deepcopy(observation)
+            if self.execution.state.get("performance_basis"):
+                for row in self.state["savings_observation"].get("holdings", {}).values():
+                    row["total_profit"] = None
 
     def capture_observation(self, now):
         markets = self.state["markets"]
@@ -254,6 +264,10 @@ class LiveStrategy:
             "lookback_days": self.engine.config.price_position_lookback_days,
             "quantile": self.engine.config.price_position_quantile,
         }
+        if self.state.get("range_policy"):
+            band = self.engine.band_history.at(timestamp, self.data)
+            self.engine.set_band(band)
+            self.state["active_price_band"] = band
 
     def initialize_indicators(self, now):
         """Seed indicators from confirmed history without replaying its decisions.
@@ -349,7 +363,7 @@ class LiveStrategy:
                     self.state["last_poll_at"] or self.state["created_at"]
                 )
 
-    def make_intent(self, steps, kind, now, expires_at):
+    def make_intent(self, steps, kind, now, expires_at, *, withdrawal_id=None):
         if kind == "trade" and self.engine.pending:
             self.engine.pending.submitted = True
         plan_id = self.engine.pending.plan_id if self.engine.pending else str(now)
@@ -361,6 +375,17 @@ class LiveStrategy:
             "steps": steps,
             "flow_id": None,
         }
+        if withdrawal_id:
+            self.state["intent"]["withdrawal_id"] = withdrawal_id
+        if kind == "trade" and self.state.get("range_policy"):
+            self.state["intent"]["range_policy_sha256"] = digest(self.state["range_policy"])
+            self.state["intent"]["range_signal"] = deepcopy(self.engine.range_signal)
+            self.event(
+                "range_policy_signal",
+                now,
+                policy_sha256=digest(self.state["range_policy"]),
+                signal=deepcopy(self.engine.range_signal),
+            )
         self.event("strategy_intent_saved", now, kind_name=kind)
         self.persist()  # Outbox precedes queue(), including a crash between the two.
         self.dispatch(now)
@@ -397,6 +422,10 @@ class LiveStrategy:
                 phase="blocked", error=code or "execution_requires_review", desired="paused"
             )
             return
+        if intent["kind"] == "withdrawal":
+            from freqtrade.strategy.trx_phase1 import live_withdrawal
+
+            live_withdrawal.finish(self, intent["withdrawal_id"], flow, now)
         if intent["kind"] == "startup":
             if flow["status"] != "completed":
                 self.state.update(
@@ -411,7 +440,7 @@ class LiveStrategy:
         if self.execution.state["anchor"]:
             self.engine.anchor = float(self.execution.state["anchor"])
             self.engine.anchor_version = self.execution.state["anchor_version"]
-        if intent["kind"] != "earn":
+        if intent["kind"] not in {"earn", "withdrawal"}:
             self.engine.pending = None
             self.state["reschedule_after_trade"] = True
         self.state["last_flow"] = {
@@ -507,7 +536,10 @@ class LiveStrategy:
         for index in indexes:
             close, price = int(stamps[index]), float(self.data.close.iloc[index])
             historical = close <= self.state["indicator_initialization"]["signals_after"]
-            self.engine.paused = had_gap or historical or not self.state["startup_complete"]
+            withdrawing = (self.state.get("intent") or {}).get("kind") == "withdrawal"
+            self.engine.paused = (
+                had_gap or historical or withdrawing or not self.state["startup_complete"]
+            )
             if not self.engine.paused:
                 self.reference_at(close)
             plan, evaluations = observed_close(
@@ -518,6 +550,8 @@ class LiveStrategy:
                 now,
                 "recovery_no_backfill"
                 if had_gap or historical
+                else "capital_withdrawal_in_progress"
+                if withdrawing
                 else "startup_not_complete"
                 if not self.state["startup_complete"]
                 else None,
@@ -558,6 +592,9 @@ class LiveStrategy:
         if not self.credential_guard():
             raise ExecutionError("credentials_changed_requires_preflight")
         self.state["last_poll_at"] = now
+        from freqtrade.strategy.trx_phase1 import live_withdrawal
+
+        live_withdrawal.advance(self, now)
         busy = self.resolve_execution(now)
         if self.state["desired"] != "running":
             if self.state["phase"] != "blocked":
@@ -572,6 +609,9 @@ class LiveStrategy:
         if not self.execution.status()["operation"]:
             self.execution.import_interest(now)
         self.execution.reload()
+        resolved = clear_verified_wait(self.state, self.execution.state, now)
+        if resolved:
+            self.event("account_evidence_wait_resolved", now, **resolved)
         self.sync_savings_observation()
         funding = self.environment(now)
         if not self.market_minutes(now, funding):
@@ -585,6 +625,7 @@ class LiveStrategy:
         self.decide(funding, now)
         self.state["error"] = None
         self.state["evidence_wait_started_at"] = None
+        self.state["evidence_wait_last_seen_at"] = None
         self.capture_observation(now)
         self.persist()
 
@@ -605,7 +646,9 @@ class LiveStrategy:
             "market_network_unavailable",
             "request_rate_wait",
         }
-        if code in EVIDENCE_WAIT_CODES:
+        evidence_wait = code in EVIDENCE_WAIT_CODES
+        if evidence_wait:
+            self.state["evidence_wait_last_seen_at"] = now
             since = self.state.get("evidence_wait_started_at")
             if since is None:
                 since = now
@@ -614,11 +657,18 @@ class LiveStrategy:
             if not retryable:
                 code = "account_evidence_wait_expired"
         self.state.update(phase="recovering" if retryable else "blocked", error=code)
-        self.recovering = True
+        if not evidence_wait:
+            self.recovering = True
         if not retryable:
             self.state["desired"] = "paused"
             self.execution.request_stop(now)
-        self.event("strategy_poll_blocked", now, code=code)
+        details = getattr(exc, "wallet_mismatch", None)
+        self.event(
+            "strategy_poll_blocked",
+            now,
+            code=code,
+            **({"wallet_mismatch": details} if details else {}),
+        )
         self.persist()
 
     def decide(self, funding, now):
@@ -641,6 +691,21 @@ class LiveStrategy:
                 self.state["phase"] = "executing"
         else:
             idle = funding.idle(now, self.state["last_cash_switch"])
+            if not idle:
+                from freqtrade.strategy.trx_phase1.external_income_reinvestment import (
+                    ReinvestmentDeferred,
+                    plan_steps,
+                )
+
+                try:
+                    self.state.pop("external_income_reinvestment", None)
+                    idle = plan_steps(self.execution, funding.terms, now)
+                except ReinvestmentDeferred as exc:
+                    self.state["external_income_reinvestment"] = {
+                        "phase": "deferred",
+                        "code": str(exc),
+                        "checked_at": now,
+                    }
             if idle:
                 self.make_intent(idle, "earn", now, now + 10 * 60000)
                 self.state["phase"] = "executing"
@@ -649,6 +714,12 @@ class LiveStrategy:
 
     def start(self):
         with self.lock:
+            if self.state.get("trading_authorized") is False:
+                raise ExecutionError("adopted_trading_not_authorized")
+            if self.state.get(
+                "startup_mode"
+            ) == "existing_positions_market_value_v1" and not self.state.get("performance_basis"):
+                raise ExecutionError("actual_start_basis_required")
             if self.thread and self.thread.is_alive():
                 raise ExecutionError("strategy_already_running")
             if not self.execution.broker.writes_enabled:
@@ -715,4 +786,10 @@ class LiveStrategy:
         if not running and result["desired"] == "running":
             result["phase"] = "restart_requires_preflight"
         result["execution"] = self.execution.status()
+        result["reconciliation_wait"] = pending_wait(
+            state, int(time.time() * 1000), result["execution"]
+        )
+        if result["reconciliation_wait"]:
+            result["persisted_error"] = result["error"]
+            result["error"] = None
         return result

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>通知与接收确认</title>
+<style>
+body{font:16px/1.7 system-ui,-apple-system,sans-serif;background:#fff;color:#263c4c;max-width:960px;margin:32px auto;padding:0 20px}h1{font-size:26px}h2{font-size:18px;margin:8px 0}a{color:#176aa3}form,.actions{display:flex;gap:12px;flex-wrap:wrap;align-items:end}label{display:flex;flex-direction:column}input,button{font:inherit;padding:8px 12px;border:1px solid #bccbd4;border-radius:5px}button{background:#176aa3;color:#fff;cursor:pointer}button:disabled{opacity:.45;cursor:default}.note{padding:14px 18px;background:#eef6ff;border-left:4px solid #347bb9;margin:20px 0}.card{border:1px solid #dce5eb;border-radius:8px;margin:16px 0;padding:18px}.uncertain{border-left:4px solid #d28c16}.confirmed{border-left:4px solid #21804b}.focused{outline:2px solid #347bb9}pre{font:14px/1.7 system-ui,sans-serif;white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0}small,.muted{color:#617283}.badge{font-weight:600}.error{color:#af3434}.ack{display:flex;flex-direction:row;gap:8px;margin:14px 0;align-items:start}.ack input{margin-top:8px}#status{min-height:28px}[hidden]{display:none!important}code{font-size:13px}@media(max-width:600px){body{margin:18px auto;padding:0 14px}.card{padding:14px}h1{font-size:23px}}
+</style>
+<h1>通知与接收确认</h1>
+<p><a href="/trx?section=account">返回策略页面</a> · <span id="source">当前网站通知</span></p>
+<div class="note">逐条核对通知的编号、时间和内容。新通知可在 Telegram 点击“确认收到”。确认只登记已读，不会解除实际故障、恢复策略或执行交易。<br>旧消息未保存 Telegram 消息编号，无法补加按钮，也不会自动重发；请先在 Telegram 核对，再在这里确认。</div>
+<form id="login"><label>网站账号<input id="username" autocomplete="username" required></label><label>登录密码<input id="password" type="password" autocomplete="current-password" required></label><button>登录查看通知</button></form>
+<div id="controls" class="actions" hidden><button id="refresh">刷新通知</button><label>显示范围<select id="filter"><option value="true">发送结果待核对</option><option value="false">全部通知</option></select></label></div>
+<p id="status" role="status"></p><main id="items"></main><button id="more" hidden>加载更早通知</button>
+<script>
+let token='',next=null,busy=false;const el=id=>document.getElementById(id);
+const date=v=>v==null?'无记录':new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',dateStyle:'short',timeStyle:'medium',hour12:false}).format(new Date(v))+'（上海）';
+const states={pending:'尚未发送',sending:'发送结果未确认',unknown:'发送结果未确认',sent:'Telegram 已确认发送',superseded:'发送前已解除，未发送'};
+function message(text,error=false){el('status').textContent=text;el('status').className=error?'error':'';}
+async function api(path,body){const response=await fetch('/api/v1/trx/live/notifications'+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});if(!response.ok)throw new Error(response.status===401?'登录已过期，请刷新后重新登录。':'请求未完成，请刷新核对确认状态。');return response.json();}
+function text(tag,value,parent,cls){const n=document.createElement(tag);n.textContent=value;if(cls)n.className=cls;parent.append(n);return n;}
+function card(item){const box=document.createElement('article');box.id=item.reference;box.className='card '+(item.acknowledged_at?'confirmed':(['unknown','sending'].includes(item.delivery_state)?'uncertain':''));
+text('code',item.reference,box);text('h2',item.title,box);text('small','通知产生：'+date(item.created_at)+'；发送尝试：'+date(item.attempted_at),box);
+text('p',states[item.delivery_state]+' · '+(item.acknowledged_at?'已确认收到：'+date(item.acknowledged_at)+'（'+(item.acknowledgment_source==='telegram'?'Telegram':'网页')+'）':'尚无人工接收确认'),box,'badge');
+text('pre',item.body,box);if(!item.exact_sent_text)text('small','旧记录摘要：发送时的完整文案未留存，请结合时间和标题在 Telegram 核对。',box);
+if(!item.acknowledged_at&&item.attempted_at!=null){const label=document.createElement('label');label.className='ack';const check=document.createElement('input');check.type='checkbox';label.append(check);text('span','我已在 Telegram 看到并核对这条通知',label);box.append(label);const button=text('button','确认收到此条通知',box);button.disabled=true;check.onchange=()=>{button.disabled=!check.checked;};button.onclick=async()=>{button.disabled=true;try{await api('/'+item.id+'/ack',{received:true,reference:item.reference});message('已记录收到 '+item.reference+'；策略与告警状态未改变。');await load(false,true);}catch(error){message(error.message,true);button.disabled=!check.checked;}};}
+el('items').append(box);if(decodeURIComponent(location.hash.slice(1))===item.reference){box.classList.add('focused');box.scrollIntoView({block:'center'});}}
+async function load(append=false,preserve=false){if(busy)return;busy=true;el('refresh').disabled=true;el('more').disabled=true;try{const data=await api('?limit=30&unresolved='+el('filter').value+(append&&next?'&before='+next:''));if(!append)el('items').replaceChildren();el('source').textContent=data.source_label+'｜'+data.source_domain;data.items.forEach(card);next=data.next_before;el('more').hidden=!next;if(!preserve)message(el('items').children.length?'已加载通知，确认前请逐条核对 Telegram。':(el('filter').value==='true'?'没有发送结果待核对的通知。':'暂无通知。'));}catch(error){message(error.message,true);}finally{busy=false;el('refresh').disabled=false;el('more').disabled=false;}}
+el('login').onsubmit=async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{const auth=btoa(String.fromCharCode(...new TextEncoder().encode(el('username').value+':'+el('password').value)));const response=await fetch('/api/v1/token/login',{method:'POST',headers:{Authorization:'Basic '+auth},cache:'no-store'});if(!response.ok)throw new Error('登录失败，请核对网站账号和密码。');token=(await response.json()).access_token;if(!token)throw new Error('登录结果异常。');el('password').value='';el('login').hidden=true;el('controls').hidden=false;if(location.hash)el('filter').value='false';await load();}catch(error){message(error.message,true);}finally{button.disabled=false;}};
+el('refresh').onclick=()=>load();el('filter').onchange=()=>load();el('more').onclick=()=>load(true);
+</script></html>

@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import jwt
 import pytest
@@ -27,6 +28,7 @@ def test_server_login_refresh_and_trx_authentication(config, mocker):
     restore = mocker.patch.object(api_trx, "start_live_restore")
     shutdown = mocker.patch.object(api_trx, "shutdown_live_services")
     account = mocker.Mock()
+    account.config_path = Path(config["user_data_dir"]) / "trx_phase1/bitget-account.local.json"
     account.status.return_value = {"mode": "fixture"}
     app = create_app(config)
     app.dependency_overrides[api_trx.get_account_service] = lambda: account

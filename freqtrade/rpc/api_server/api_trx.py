@@ -16,6 +16,7 @@ from freqtrade.rpc.api_server.deps import get_config, get_exchange
 from freqtrade.rpc.api_server.trx_diagnostic_reader import diagnostic_reader
 from freqtrade.strategy.trx_phase1 import diagnostics
 from freqtrade.strategy.trx_phase1.account import AccountBusy, AccountService
+from freqtrade.strategy.trx_phase1.adoption_preview import adoption_preview
 from freqtrade.strategy.trx_phase1.candidate_stability import (
     load_stability_source,
     run_stability_study,
@@ -151,7 +152,60 @@ def get_account_service(config=Depends(get_config)):
 @router.get("/account")
 def account_status(service=Depends(get_account_service)):
     """Local status only; this GET never triggers a private exchange request."""
-    return service.status()
+    result = service.status()
+    control = service.config_path.parent / "live-strategy-control.json"
+    if (
+        control.exists()
+        and json.loads(control.read_text()).get("allocation_mode")
+        == "existing_positions_market_value_v1"
+    ):
+        result["strategy_allocation"] = "adopted_existing_positions"
+    return result
+
+
+@router.get("/account/adoption-preview")
+def account_adoption_preview(service=Depends(get_account_service)):
+    """Project the cached snapshot only; never initialize, freeze or adopt assets."""
+    result = adoption_preview(
+        service.status(),
+        strategy_initialized=(service.config_path.parent / "live-strategy-control.json").exists(),
+    )
+    from freqtrade.strategy.trx_phase1.opening_adoption import status
+
+    result["adoption"] = live_call(status, service.config_path.parent)["receipt"]
+    result["startup_preview"] = account_startup_preview(service) if result["adoption"] else None
+    if result["adoption"]:
+        from freqtrade.strategy.trx_phase1.startup_basis import context
+
+        result["performance_basis"] = live_call(context, service.config_path.parent)[1].get(
+            "performance_basis"
+        )
+    return result
+
+
+@router.get("/account/startup-preview")
+def account_startup_preview(service=Depends(get_account_service)):
+    """Cached current assets at provisional prices, never a committed start."""
+    from freqtrade.strategy.trx_phase1.startup_basis import preview
+
+    account, account_id = service.allocation_context()
+    result = live_call(preview, service.config_path.parent, account, int(service.clock() * 1000))
+    if result is not None and account_id:
+        control = json.loads(
+            (service.config_path.parent / "live-strategy-control.json").read_text()
+        )
+        if account_id != control["account_id"]:
+            result["blockers"].append("account_binding_mismatch")
+            result["reviewable"] = False
+    return result
+
+
+@router.get("/account/adoption")
+def opening_adoption_status(config=Depends(get_config)):
+    """Read the committed opening receipt; no financial action is exposed here."""
+    from freqtrade.strategy.trx_phase1.opening_adoption import status
+
+    return live_call(status, Path(config["user_data_dir"]) / "trx_phase1")
 
 
 @router.get("/execution")
@@ -164,7 +218,8 @@ def live_execution_status(config=Depends(get_config)):
 def refresh_account(service=Depends(get_account_service)):
     """Explicitly read the account; no financial write endpoint exists here."""
     try:
-        return service.refresh()
+        service.refresh()
+        return account_status(service)
     except AccountBusy as exc:
         raise HTTPException(409, str(exc)) from None
 
@@ -211,13 +266,49 @@ def live_call(method, *args):
         raise HTTPException(409, "live_operation_failed") from None
 
 
+class LiveReserveRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    account_id: str = Field(min_length=1, max_length=128)
+    allocation_id: str = Field(min_length=8, max_length=96, pattern="^[a-zA-Z0-9_-]+$")
+
+
+@router.post("/live/reserve/half")
+def live_reserve_half(body: LiveReserveRequest, service=Depends(get_live_service)):
+    """Allocate half of current strategy USDGO to an earned, non-trading reserve."""
+    return live_call(service.reserve_half, body.account_id, body.allocation_id)
+
+
 class LiveStartRequest(BaseModel):
     review_hash: str = Field(min_length=64, max_length=64, pattern="^[a-f0-9]+$")
+
+
+class LiveSelectedContributionRequest(BaseModel):
+    model_config = {"extra": "forbid", "strict": True}
+    coin: str | None = None
+    amount: str | None = None
+    holding_id: str | None = None
+    product_id: str | None = None
+    account_id: str | None = None
+
+
+class LiveSelectedContributionConfirmRequest(LiveSelectedContributionRequest):
+    review_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 class LiveReconcileRequest(BaseModel):
     operation_id: str | None = Field(default=None, max_length=128)
     exchange_id: str | None = Field(default=None, max_length=128)
+
+
+class LiveWithdrawalReviewRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    amount: str = Field(min_length=1, max_length=32, pattern=r"^\d{1,15}(\.\d{1,8})?$")
+    destination: Literal["same_account_spot"]
+
+
+class LiveWithdrawalConfirmRequest(LiveStartRequest):
+    model_config = {"extra": "forbid"}
+    destination: Literal["same_account_spot"]
 
 
 @router.get("/live")
@@ -264,6 +355,39 @@ def live_pause(service=Depends(get_live_service)):
 def live_contribution_preview(service=Depends(get_live_service)):
     """Reconcile and preview external assets; never place an order or adopt assets."""
     return live_call(service.contribution)
+
+
+@router.post("/live/contribution/selected/preview")
+def live_selected_contribution_preview(
+    body: LiveSelectedContributionRequest | None = None, service=Depends(get_live_service)
+):
+    selection = body.model_dump(exclude_unset=True) if body else {}
+    return live_call(service.selected_contribution, None, selection)
+
+
+@router.post("/live/contribution/selected/confirm")
+def live_selected_contribution_confirm(
+    body: LiveSelectedContributionConfirmRequest, service=Depends(get_live_service)
+):
+    selection = body.model_dump(exclude={"review_hash"}, exclude_unset=True)
+    return live_call(service.selected_contribution, body.review_hash, selection)
+
+
+@router.get("/live/contribution/selected/status")
+def live_selected_contribution_status(service=Depends(get_live_service)):
+    return live_call(service.selected_contribution, None, None, True)
+
+
+@router.post("/live/withdrawal/review")
+def live_withdrawal_review(body: LiveWithdrawalReviewRequest, service=Depends(get_live_service)):
+    """Fresh account and price checks; no redemption or capital debit."""
+    return live_call(service.withdrawal, body.amount)
+
+
+@router.post("/live/withdrawal/confirm")
+def live_withdrawal_confirm(body: LiveWithdrawalConfirmRequest, service=Depends(get_live_service)):
+    """Explicitly authorize only the reviewed USDGO withdrawal to same-account spot."""
+    return live_call(service.withdrawal, None, body.review_hash)
 
 
 @router.post("/live/contribution/confirm")

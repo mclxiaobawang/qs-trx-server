@@ -187,7 +187,7 @@ class LiveFunding:
             raise ExecutionError("current_apr_tiers_unverified")
         held = sum(
             (
-                money(p["principal"]) + money(p["interest"])
+                money(p["principal"]) + money(p["interest"]) + money(p.get("unassigned_amount", 0))
                 for p in self.execution["holdings"].values()
                 if p["coin"] == coin
             ),
@@ -219,7 +219,10 @@ class LiveFunding:
             return []
         cash, market = self.book.free_cash, self.markets["USDGOUSDT"]
         fee, bid, ask = (money(market[k]) for k in ("fee", "bid", "ask"))
-        amount = cash / (ask * (1 + fee)) * (1 - fee)
+        amount = rounded(
+            cash / (ask * (1 + fee)) * (1 - fee),
+            int(self.terms["USDGO"]["subscribePrecision"]),
+        )
         eligible = self.eligible_subscription("USDGO", amount)
         if cash < money(self.config.cash_min_switch_value) or eligible < amount:
             return []

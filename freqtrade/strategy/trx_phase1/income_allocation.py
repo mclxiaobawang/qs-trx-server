@@ -25,6 +25,7 @@ def ownership(positions):
             "product_id": p["product_id"],
             "strategy": str(money(p["principal"]) + money(p["interest"])),
             "external": str(money(p["unassigned_amount"])),
+            **({"reserve": str(money(p["reserved_amount"]))} if "reserved_amount" in p else {}),
         }
         for key, p in positions.items()
     }
@@ -35,15 +36,26 @@ def accounting_for(execution, positions, now):  # noqa: C901 - validate one boun
 
     previous = execution.state.get("income_accounting")
     path = execution.root.parents[1] / "income-allocation-policy.json"
-    if not path.exists():
+    basis = execution.state.get("performance_basis")
+    if not basis and not path.exists():
         if previous:
             return {**deepcopy(previous), "status": "policy_file_missing"}
         return None
     accounting = deepcopy(previous or {"allocations": {}})
     try:
-        if path.stat().st_size > 1048576:
-            raise ValueError
-        policy = json.loads(path.read_text())
+        if basis:
+            policy = execution.state["startup_income_policy"]
+            if (
+                basis["sha256"] != digest({k: v for k, v in basis.items() if k != "sha256"})
+                or digest(policy) != basis["income_policy_sha256"]
+                or policy["approved_at"] != basis["started_at"]
+                or execution.state["created_at"] != basis["started_at"]
+            ):
+                raise ValueError
+        else:
+            if path.stat().st_size > 1048576:
+                raise ValueError
+            policy = json.loads(path.read_text())
         fingerprint = digest(policy)
         if (
             policy["version"] != VERSION
@@ -88,7 +100,7 @@ def accounting_for(execution, positions, now):  # noqa: C901 - validate one boun
     return accounting
 
 
-def effective_units(history, coin, start, end):
+def effective_units(history, coin, start, end, include_reserve=False):  # noqa: C901 - preserve one accrual timeline
     before = [p for p in history if p["timestamp"] <= start]
     first = before[-1] if before else history[0]
     points = [first, *(p for p in history if start < p["timestamp"] < end)]
@@ -96,21 +108,30 @@ def effective_units(history, coin, start, end):
     # Under the existing complete-hour convention, transfer ownership becomes
     # effective for the next whole accrual hour. Preserve the external weight in
     # the transition hour instead of losing it to two independent minima.
-    transfers, adjusted = {}, []
+    transfers, reserve_transfers, adjusted = {}, {}, []
     for point in points:
         if point["timestamp"] > start:
             for key, amount in point.get("capital_transfers", {}).items():
                 transfers[key] = transfers.get(key, money(0)) + money(amount)
+            for key, amount in point.get("reserve_transfers", {}).items():
+                reserve_transfers[key] = reserve_transfers.get(key, money(0)) + money(amount)
         positions = deepcopy(point["positions"])
         for key, amount in transfers.items():
             if key in positions:
                 row = positions[key]
                 row["strategy"] = str(max(money(0), money(row["strategy"]) - amount))
                 row["external"] = str(money(row["external"]) + amount)
+        for key, amount in reserve_transfers.items():
+            if key in positions:
+                positions[key]["reserve"] = str(
+                    max(money(0), money(positions[key].get("reserve", 0)) - amount)
+                )
         adjusted.append({**point, "positions": positions})
     points = adjusted
     keys = {k for p in points for k, v in p["positions"].items() if v["coin"] == coin}
     totals = {"strategy": money(0), "external": money(0)}
+    if include_reserve:
+        totals["reserve"] = money(0)
     products = set()
     for key in keys:
         for point in points:
@@ -162,7 +183,19 @@ def allocate(execution, book, positions, receipts, records, remote, now):  # noq
             continue
         coin, stamp = credit["coin"], credit["timestamp"]
         end = stamp // HOUR * HOUR
-        weights, products = effective_units(history, coin, end - HOUR, end)
+        basis = execution.state.get("performance_basis")
+        if basis and end - HOUR < basis["started_at"] < end:
+            # The overlapping hour cannot be assigned using arrival time alone.
+            # Keep the actual asset outside performance until separately resolved.
+            accounting.setdefault("cross_start_receipts", {})[pending_key] = {
+                "coin": coin,
+                "amount": credit["amount"],
+                "period_start": end - HOUR,
+                "period_end": end,
+                "reason": "cross_start_accrual_pending",
+            }
+            continue
+        weights, products = effective_units(history, coin, end - HOUR, end, include_reserve=True)
         observed_products = {p["product_id"] for p in remote.values() if p["coin"] == coin}
         if (
             len(products) != 1
@@ -174,12 +207,15 @@ def allocate(execution, book, positions, receipts, records, remote, now):  # noq
         if pending_key in accounting["allocations"]:
             accounting["status"] = "allocation_conflict"
             continue
-        total = sum(weights.values(), money(0))
+        total = weights["strategy"] + weights["external"]
         if total <= 0:
             accounting["status"] = "eligible_principal_required"
             continue
         amount = money(credit["amount"])
         strategy = (amount * weights["strategy"] / total).quantize(UNIT, rounding=ROUND_DOWN)
+        reserved = (amount * weights["reserve"] / total).quantize(UNIT, rounding=ROUND_DOWN)
+        if reserved > amount - strategy:
+            raise ValueError("reserve_income_conservation_failed")
         key = "income-allocation:" + credit["bill_id"]
         if key in receipts or key in book.events:
             accounting["status"] = "allocation_conflict"
@@ -195,6 +231,11 @@ def allocate(execution, book, positions, receipts, records, remote, now):  # noq
             "amount": str(strategy),
             "account_amount": str(amount),
             "external_amount": str(amount - strategy),
+            **(
+                {"reserve_amount": str(reserved), "reserve_units": str(weights["reserve"])}
+                if execution.state.get("usdgo_reserve") and coin == "USDGO"
+                else {}
+            ),
             "strategy_units": str(weights["strategy"]),
             "external_units": str(weights["external"]),
             "period_start": end - HOUR,
@@ -236,6 +277,7 @@ def summary(accounting):
         "status": accounting["status"],
         "approved_at": accounting.get("approved_at"),
         "allocated_receipts": len(allocations),
+        "cross_start_receipts": list(accounting.get("cross_start_receipts", {}).values()),
         "totals": {
             coin: {k: str(v) for k, v in amounts.items()} for coin, amounts in totals.items()
         },

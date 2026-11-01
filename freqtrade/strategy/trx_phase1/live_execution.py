@@ -32,6 +32,10 @@ from freqtrade.strategy.trx_phase1.live_broker import (
     positive,
     rounded,
 )
+from freqtrade.strategy.trx_phase1.reconciliation_wait import (
+    verified_income_candidate,
+    wallet_error,
+)
 
 
 CANCEL_RECOVERY_MS = 60000
@@ -80,7 +84,9 @@ class ExecutionStep(BaseModel):
     coin: Literal["TRX", "USDGO"] | None = None
     product_id: str | None = None
     holding_id: str | None = None
-    source: Literal["principal", "interest"] = "principal"
+    source: Literal["principal", "interest", "external_interest"] = "principal"
+    external_income_sources: dict[str, Decimal] = Field(default_factory=dict)
+    external_income_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     reference_price: Decimal | None = Field(default=None, gt=0)
     maximum_deviation: Decimal = Field(default=Decimal("0.01"), gt=0, lt=Decimal("0.5"))
     minimum_receive: Decimal = Field(default=Decimal(0), ge=0)
@@ -111,6 +117,21 @@ class ExecutionStep(BaseModel):
     def complete_request(self):
         if self.amount != "previous":
             positive(self.amount)
+        if self.source == "external_interest":
+            if (
+                self.kind != "subscribe"
+                or self.coin != "USDGO"
+                or self.amount == "previous"
+                or not self.external_income_sources
+                or not self.external_income_policy_sha256
+                or any(q <= 0 for q in self.external_income_sources.values())
+                or sum(self.external_income_sources.values(), money(0)) != self.amount
+            ):
+                raise ValueError(
+                    "External interest only permits a receipt-funded USDGO subscription"
+                )
+        elif self.external_income_sources or self.external_income_policy_sha256:
+            raise ValueError("External income evidence requires its dedicated source")
         if self.kind == "trade":
             if not self.symbol or not self.side or self.reference_price is None:
                 raise ValueError("Trade requires symbol, side and reviewed reference price")
@@ -172,8 +193,13 @@ class LiveExecution:
             }
             cash_baseline = {
                 identifier(b["billId"]): digest(cls.interest_bill(b))
-                for b in broker.bills("USDT", max(0, observed - DAY), observed)
-                if b.get("groupType") == "other" and b.get("businessType") == "REBATE_REWARDS"
+                for coin in COINS
+                for b in broker.bills(coin, max(0, observed - DAY), observed)
+                if b.get("groupType") == "other"
+                and (
+                    b.get("businessType") == "ACTIVITY_ASSET_REWARD_USER_IN"
+                    or (coin == "USDT" and b.get("businessType") == "REBATE_REWARDS")
+                )
             }
             if broker.balances() != balances:
                 raise ExecutionError("account_changed_during_allocation")
@@ -237,7 +263,14 @@ class LiveExecution:
     def event(self, kind, now, **values):
         self.state["events"].append({"kind": kind, "timestamp": now, **values})
 
+    def require_trading_authorized(self, code="adopted_trading_not_authorized"):
+        if self.state.get("trading_authorized") is False:
+            raise ExecutionError(code)
+        if self.state.get("opening_adoption") and not self.state.get("performance_basis"):
+            raise ExecutionError("actual_start_basis_required")
+
     def queue(self, steps, *, now, expires_at, label, strategy_snapshot=None, intent_id=None):
+        self.require_trading_authorized()
         if strategy_snapshot is not None:
             verified = ResearchConfig.from_saved(strategy_snapshot).model_dump()
             if verified != strategy_snapshot:
@@ -299,6 +332,7 @@ class LiveExecution:
 
     def tick(self, now):
         """One bounded step. No automatic write resubmissions or retrospective signals."""
+        self.require_trading_authorized()
         with self.exclusive():
             self.reload()
             if self.broker.account_id() != self.account_id:
@@ -349,10 +383,17 @@ class LiveExecution:
         offsets, _ = self.income_adjustments(income_records)
         for coin, owned in self.owned_spot(book).items():
             actual = sum((money(v) for v in balances[coin].values()), money(0))
-            if actual != owned + money(offsets[coin]):
-                raise ExecutionError("wallet_reconciliation_required")
+            expected = owned + money(offsets[coin])
+            if actual != expected:
+                raise wallet_error("wallet_reconciliation_required", coin, actual, expected)
             if money(balances[coin]["available"]) < owned:
-                raise ExecutionError("owned_balance_not_spendable")
+                raise wallet_error(
+                    "owned_balance_not_spendable",
+                    coin,
+                    money(balances[coin]["available"]),
+                    owned,
+                    basis="available",
+                )
 
     def product_rule(self, step):
         matches = [
@@ -396,12 +437,15 @@ class LiveExecution:
             flow["outputs"][-1]["amount"] if step.amount == "previous" else step.amount
         )
         book = Ledger.restore(self.state["book"])
-        book, positions, receipts, income_records, accounting = self.income_candidate(
-            book, self.state["holdings"], self.state["receipts"], now
+        book, positions, receipts, income_records, accounting, balances, verified_at = (
+            verified_income_candidate(
+                self, book, self.state["holdings"], self.state["receipts"], now
+            )
         )
-        balances = self.broker.balances()
-        self.check_wallet(balances, book, income_records)
-        self.commit_candidate(book, positions, receipts, income_records, now, accounting)
+        flow = self.state["flow"]
+        if flow["status"] == "expired":
+            raise ExecutionError("idle_flow_superseded_by_verified_location")
+        self.commit_candidate(book, positions, receipts, income_records, verified_at, accounting)
         client_id = "trx-" + digest([self.account_id, flow["id"], flow["index"]])[:32]
         op = {
             "id": client_id,
@@ -486,7 +530,14 @@ class LiveExecution:
                 ):
                     raise ExecutionError("subscription_terms_not_satisfied")
                 available = self.owned_spot(book)[step.coin]
-                if step.coin == "TRX":
+                if step.source == "external_interest":
+                    from freqtrade.strategy.trx_phase1.external_income_reinvestment import authorize
+
+                    if amount != money(step.amount):
+                        raise ExecutionError("external_income_precision_changed")
+                    op["external_income_policy"] = authorize(self, step, balances, book, now)
+                    available = money(self.state["unassigned_offsets"]["USDGO"])
+                elif step.coin == "TRX":
                     available = (
                         (book.principal - sum((lot.locked for lot in book.lots), money(0)))
                         if step.source == "principal"
@@ -568,8 +619,8 @@ class LiveExecution:
                 raise ExecutionError("quote_expired_during_preflight")
             op["request"]["requestTime"] = str(now)
         op["created_at"] = now
-        # Shared permit was obtained before journaling. A long redemption
-        # cooldown deferred before this point, without sleeping under the lock.
+        # Preflight freezes the deadline. The durable sending intent precedes
+        # actual shared-rate admission and the first HTTP submission.
         op["status"] = "sending"
         self.event("write_attempt", now, operation_id=op["id"], operation_kind=op["kind"])
         self.save()
@@ -886,6 +937,10 @@ class LiveExecution:
             remaining = money(holdings.get(holding_id, {}).get("amount", 0))
             if money(before[holding_id]["amount"]) - remaining > amount:
                 return
+        if step.source == "external_interest":
+            from freqtrade.strategy.trx_phase1.external_income_reinvestment import settle
+
+            return settle(self, step, op, bills, holdings, holding_id, now)
         candidate = Ledger.restore(self.state["book"])
         positions = deepcopy(self.state["holdings"])
         position = positions.setdefault(
@@ -1017,7 +1072,7 @@ class LiveExecution:
         for coin in ("TRX", "USDGO"):
             records = (
                 self.broker.savings_records(coin, start, now, order_type="pay_interest")
-                if positions
+                if positions and not self.state.get("performance_basis")
                 else []
             )
             for row in records:
@@ -1213,7 +1268,9 @@ class LiveExecution:
         )
         from freqtrade.strategy.trx_phase1.account_credits import quarantine
 
-        receipts, income_records = quarantine(self, book, receipts, income_records, now)
+        receipts, income_records = quarantine(
+            self, book, receipts, income_records, now, bills_by_coin=bills_by_coin
+        )
         return book, positions, receipts, income_records, accounting
 
     def income_adjustments(self, income_records):
@@ -1258,20 +1315,25 @@ class LiveExecution:
 
     def import_interest(self, now):
         """Import verified native credits atomically, without any exchange write."""
+        self.require_trading_authorized("adoption_income_attribution_pending")
         with self.exclusive():
             self.reload()
             if self.broker.account_id() != self.account_id:
                 raise ExecutionError("account_binding_mismatch")
             if self.state["operation"]:
                 raise ExecutionError("resolve_operation_before_interest_import")
-            book, positions, receipts, income_records, accounting = self.income_candidate(
-                Ledger.restore(self.state["book"]),
-                self.state["holdings"],
-                self.state["receipts"],
-                now,
+            book, positions, receipts, income_records, accounting, _, verified_at = (
+                verified_income_candidate(
+                    self,
+                    Ledger.restore(self.state["book"]),
+                    self.state["holdings"],
+                    self.state["receipts"],
+                    now,
+                )
             )
-            self.check_wallet(self.broker.balances(), book, income_records)
-            self.commit_candidate(book, positions, receipts, income_records, now, accounting)
+            self.commit_candidate(
+                book, positions, receipts, income_records, verified_at, accounting
+            )
             self.save()
             return len(income_records)
 

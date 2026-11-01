@@ -17,7 +17,7 @@ COINS = ("USDGO", "TRX")
 REVIEW_LIFETIME = 5 * 60000
 
 
-def candidate(execution, now):
+def candidate(execution, now, *, allow_cross_start_pending=False):
     if execution.broker.account_id() != execution.account_id:
         raise ExecutionError("account_binding_mismatch")
     state = execution.state
@@ -32,11 +32,20 @@ def candidate(execution, now):
     )
     balances = execution.broker.balances()
     execution.check_wallet(balances, book, records)
-    if (
-        execution.income_adjustments(records)[1]
-        or not accounting
-        or accounting["status"] != "active"
-    ):
+    pending = execution.income_adjustments(records)[1]
+    crossed = (accounting or {}).get("cross_start_receipts", {})
+    excluded = (
+        allow_cross_start_pending
+        and execution.state.get("performance_basis")
+        and all(
+            key in crossed
+            and crossed[key].get("reason") == "cross_start_accrual_pending"
+            and crossed[key]["coin"] == row["coin"]
+            and money(crossed[key]["amount"]) == money(row["amount"])
+            for key, row in pending.items()
+        )
+    )
+    if (pending and not excluded) or not accounting or accounting["status"] != "active":
         raise ExecutionError("contribution_requires_reconciled_income")
     remote = execution.broker.holdings(state["created_at"] - 1000, now)
     for key, row in positions.items():
@@ -77,18 +86,23 @@ def preview(execution, now):
         for coin in COINS:
             locations = []
             outside = money(execution.state["unassigned_offsets"][coin])
+            if coin == "USDGO":
+                from .live_reserve import protected_spot
+
+                outside -= protected_spot(execution.state)
             if outside < 0 or money(balances[coin]["available"]) - spot[coin] < outside:
                 raise ExecutionError("contribution_external_assets_locked")
             if outside:
                 locations.append({"location": "spot", "amount": str(outside)})
             for key, row in execution.state["holdings"].items():
-                if row["coin"] == coin and money(row["unassigned_amount"]) > 0:
+                available = money(row["unassigned_amount"]) - money(row.get("reserved_amount", 0))
+                if row["coin"] == coin and available > 0:
                     locations.append(
                         {
                             "location": "earn",
                             "holding_id": key,
                             "product_id": row["product_id"],
-                            "amount": row["unassigned_amount"],
+                            "amount": str(available),
                         }
                     )
             amount = sum((money(row["amount"]) for row in locations), money(0))
@@ -158,8 +172,11 @@ def apply(execution, review_hash, now):  # noqa: C901 - one atomic reviewed cont
                     positions.get(row.get("holding_id")) if row["location"] == "earn" else None
                 )
                 if row["location"] == "spot":
+                    from .live_reserve import protected_spot
+
+                    reserve = protected_spot(execution.state) if coin == "USDGO" else money(0)
                     if (
-                        amount > money(offsets[coin])
+                        amount > money(offsets[coin]) - reserve
                         or amount > money(balances[coin]["available"]) - spot[coin]
                     ):
                         raise ExecutionError("contribution_assets_changed")
@@ -169,7 +186,9 @@ def apply(execution, review_hash, now):  # noqa: C901 - one atomic reviewed cont
                         not holding
                         or holding["coin"] != coin
                         or holding["product_id"] != row["product_id"]
-                        or amount > money(holding["unassigned_amount"])
+                        or amount
+                        > money(holding["unassigned_amount"])
+                        - money(holding.get("reserved_amount", 0))
                     ):
                         raise ExecutionError("contribution_assets_changed")
                     holding["unassigned_amount"] = str(money(holding["unassigned_amount"]) - amount)

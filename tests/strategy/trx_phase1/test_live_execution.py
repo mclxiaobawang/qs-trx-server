@@ -70,6 +70,10 @@ class ExchangeFixture:
     def account_id(self):
         return ACCOUNT
 
+    def require_bgb_deduction_off(self):
+        if getattr(self, "bgb_deduction", "off") != "off":
+            raise ExecutionError("disable_bgb_deduction_before_start")
+
     def balances(self):
         if self.read_failure:
             raise ExecutionError("exchange_response_unavailable")

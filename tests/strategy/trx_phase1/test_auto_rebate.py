@@ -90,6 +90,10 @@ def test_old_other_currency_and_manually_adopted_receipts_are_excluded():
     assert eligible(work, policy, NOW) == []
     state["quarantined_account_credits"]["account-credit:bill"]["coin"] = "TRX"
     assert eligible(state, policy, NOW) == []
+    state["quarantined_account_credits"]["account-credit:bill"].update(
+        coin="USDT", type="BATCH_INTEREST_USER_IN"
+    )
+    assert eligible(state, policy, NOW) == []
 
 
 def test_observer_requires_matching_fresh_status_and_counts_durable_records(tmp_path):

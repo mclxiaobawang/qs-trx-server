@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>旧账户 USDGO 定额追加本金</title>
+<style>
+body{font:16px/1.7 system-ui,-apple-system,sans-serif;color:#193044;background:#fff;max-width:1080px;margin:32px auto;padding:0 22px}h1{font-size:27px}h2{font-size:21px}.note{padding:14px 18px;background:#eef6ff;border-left:4px solid #347bb9}.success{background:#edf7f1;border-color:#268557}form,.actions{display:flex;flex-wrap:wrap;gap:14px;align-items:end;margin:22px 0}label{display:flex;flex-direction:column;gap:5px}input,button{font:inherit;border:1px solid #bdcbd5;border-radius:6px;padding:9px 12px}button{background:#176aa3;color:white;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{padding:16px;border:1px solid #dce5eb;border-radius:8px}.card strong{display:block;font-size:22px;font-weight:500}.card span,small{color:#617283}.table{overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:11px;border-bottom:1px solid #dce5eb;text-align:left;white-space:nowrap}th{background:#f4f7f9}#status{min-height:28px}.error{color:#b63932}.ack{display:flex;flex-direction:row;align-items:start;margin-top:22px}.ack input{margin-top:9px}code{overflow-wrap:anywhere;font-size:12px}[hidden]{display:none!important}@media(max-width:650px){body{margin:20px auto;padding:0 15px}.cards{grid-template-columns:1fr}h1{font-size:23px}}
+</style>
+<h1>旧账户 USDGO 定额追加本金</h1>
+<div class="note">Max｜trx.octo-agent.com<br><span id="scope-details">登录后核对本批已审核的 USDGO 理财定额清单。资产继续保留在本账户理财中，确认后按原策略参与后续交易，不做首次买入。</span></div>
+<form id="login">
+<label>旧网站登录账号<input id="username" autocomplete="username" required></label>
+<label>登录密码<input id="password" type="password" autocomplete="current-password" required></label>
+<button>登录并检查</button>
+</form>
+<div class="actions" id="actions" hidden><button id="prepare">生成定额确认清单</button><button id="check">查询本批并入状态</button></div>
+<p id="status" role="status"></p>
+<main id="review" hidden>
+<div class="note" id="review-note"></div>
+<p id="snapshot"></p>
+<div class="cards">
+<div class="card"><span>本次追加 USDGO</span><strong id="quantity">—</strong></div>
+<div class="card"><span>追加本金估值（USDT）</span><strong id="capital"></strong></div>
+<div class="card"><span>追加后买入预算估算（USDT）</span><strong id="budget"></strong></div>
+</div>
+<h2>本金、成本和收益</h2>
+<div class="table"><table><thead><tr><th>核对项目</th><th>当前策略</th><th>假设追加后</th></tr></thead><tbody id="comparison"></tbody></table></div>
+<p id="budget-note"></p>
+<h2>本次资金来源</h2><p id="source"></p>
+<div class="table"><table><thead><tr><th>位置</th><th>币种</th><th>追加后仍在策略外</th></tr></thead><tbody id="excluded"></tbody></table></div>
+<h2>利息归属</h2><p id="interest"></p>
+<p>追加前及过渡计息小时沿用原归属，即使之后才到账也不会补算为策略收益。原 TRX 成本、历史收益和收益起点保留，追加本金不算利润。</p>
+<p><small>清单标识：<code id="hash"></code></small></p>
+<label class="ack"><input id="ack" type="checkbox"><span id="ack-text">我已核对上述定额清单，并允许这些资金按原策略参与后续交易。</span></label>
+<div class="actions"><button id="confirm" disabled>确认并入选定的 USDGO</button></div>
+</main>
+<section id="receipt" class="note success" hidden><b>本批已正式并入</b><p id="receipt-text"></p><p>请返回旧网站查看策略本金和买入预算；再次提交不会重复并入。</p><a href="/trx?section=account">返回旧网站账户页面</a></section>
+<script>
+let token='',current=null,fixed=null,busy=false,confirmed=false;
+const el=id=>document.getElementById(id);
+const num=(v,d=4)=>Number(v).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d});
+const date=v=>new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',dateStyle:'short',timeStyle:'medium',hour12:false}).format(new Date(v));
+function message(text,error=false){el('status').textContent=text;el('status').className=error?'error':'';}
+function controls(){const pending=current?.status==='confirmation_pending';el('confirm').disabled=busy||confirmed||!current||!el('ack').checked||(!pending&&Date.now()>=current.expires_at);el('confirm').textContent=pending?'核对上次确认结果（同一清单）':(fixed?'确认并入这 '+num(fixed.amount,8)+' USDGO':'确认并入选定的 USDGO');el('prepare').disabled=busy||confirmed;el('check').disabled=busy;}
+function row(id,cells){const tr=document.createElement('tr');for(const value of cells){const td=document.createElement('td');td.textContent=value;tr.appendChild(td);}el(id).appendChild(tr);}
+async function api(path,body){
+ const response=await fetch('/api/v1/trx/live/contribution/selected/'+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});
+ const data=await response.json();if(!response.ok){const code=data.detail||'request_failed';throw new Error((response.status===401?'登录已过期，请刷新页面重新登录。':response.status===409?'本次检查暂未通过，请核对状态后重新生成清单。':'请求未完成，请查询本批状态。')+' ['+String(code)+']');}return data;
+}
+function showReceipt(record){confirmed=true;current=null;el('ack').checked=false;el('review').hidden=true;el('receipt').hidden=false;el('receipt-text').textContent=`确认时间：${date(record.timestamp)}（上海）；并入数量 ${num(record.assets[0].amount,8)} USDGO，追加本金 ${num(record.value,6)} USDT。`;message('本批已并入，已禁止重复追加。');controls();}
+function render(data){
+ const p=data.projection,s=p.selection,a=p.before,b=p.after;
+ if(!fixed||!data.fixed_selection||data.assets.length!==1||data.assets[0].coin!=='USDGO'||data.assets[0].amount!==fixed.amount||s.holding_id!==fixed.holding_id||s.product_id!==fixed.product_id)throw new Error('定额清单不匹配，请停止操作。');
+ current=data;el('ack').checked=false;el('review').hidden=false;
+ el('review-note').textContent=data.status==='confirmation_pending'?'上次确认结果尚待核对。请先查询本批并入状态；同一清单重复提交不会重复记账。':'尚未正式并入。请核对清单后勾选确认。';
+ el('snapshot').textContent=`快照：${date(p.observed_at)}；清单有效至 ${date(data.expires_at)}（上海）。确认时重新核对余额和报价，变动超过 1% 会拒绝本次确认。`;
+ el('quantity').textContent=num(s.amount,8);el('ack-text').textContent=`我已核对：仅追加本批理财中的 ${num(s.amount,8)} USDGO，按确认时最新买一价计入本金和 USDGO 成本，并允许其按原策略参与后续交易。`;el('capital').textContent=num(s.value_usdt,6);el('budget').textContent=num(b.buy.target_budget_usdt,6);
+ el('comparison').replaceChildren();for(const [label,key,digits] of [['初始本金（USDT）','initial_capital_usdt',4],['累计净投入本金（USDT）','net_capital_usdt',4],['策略 USDGO 数量','usdgo_quantity',8],['USDGO 成本（USDT）','usdgo_cost_usdt',4],['TRX 成本（USDT）','trx_cost_usdt',4],['累计净利润（USDT）','profit_usdt',6],['基金份额','fund_units',8],['单位净值','nav',12]])row('comparison',[label,num(a[key],digits),num(b[key],digits)]);
+ row('comparison',['买入预算估算（USDT）',num(a.buy.target_budget_usdt),num(b.buy.target_budget_usdt)]);
+ el('budget-note').textContent=`原买入比例 ${num(Number(b.buy.base_fraction)*100,2)}%，P75 倍率 ${num(b.buy.p75_multiplier,2)}。预算会随行情和策略信号变化；并入本身不会下单。`;
+ el('source').textContent=`仅选择理财持仓 ${s.holding_id}，产品 ${s.product_id}；按 ${num(s.mark_usdt,6)} USDT/USDGO 估值，剩余 ${num(s.external_earn_after,8)} USDGO 仍在策略外。`;
+ el('excluded').replaceChildren();for(const [coin,amount]of Object.entries(p.excluded.all_external_spot))row('excluded',['现货',coin,num(amount,8)]);for(const v of Object.values(p.excluded.remaining_external_earn))row('excluded',['理财',v.coin,num(v.amount,8)]);
+ el('interest').textContent=`按当前清单时点估算，新增份额从 ${date(p.interest.first_complete_period_start)} 至 ${date(p.interest.first_complete_period_end)} 的完整计息周期开始归入策略。正式确认时重新确定。`;
+ el('hash').textContent=data.review_hash;controls();
+}
+async function check(){const result=await api('status');fixed=result.selection;if(!fixed||fixed.coin!=='USDGO')throw new Error('定额配置暂不可用。');el('scope-details').textContent=`仅将本批理财中的 ${num(fixed.amount,8)} USDGO 记为追加本金。资产继续留在本账户理财中，现货及其他资产仍在策略外；确认后按原策略参与后续交易，不做首次买入。`;if(result.record)showReceipt(result.record);else {if(result.status==='not_confirmed'&&current?.status==='confirmation_pending'){current=null;el('review').hidden=true;el('ack').checked=false;}message(result.status==='confirmation_pending'?'确认结果尚待核对，请先生成同一清单再核对结果；不要提交其他批次。':'本批尚未并入，可生成定额确认清单。');}return result;}
+async function action(fn){busy=true;controls();try{await fn();}catch(error){message(error.message,true);}finally{busy=false;controls();}}
+el('login').addEventListener('submit',async event=>{event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;try{message('正在登录旧网站…');const auth=btoa(String.fromCharCode(...new TextEncoder().encode(el('username').value+':'+el('password').value)));const response=await fetch('/api/v1/token/login',{method:'POST',headers:{Authorization:'Basic '+auth},cache:'no-store'});if(!response.ok)throw new Error('登录失败，请核对旧网站账号和密码。');token=(await response.json()).access_token;if(!token)throw new Error('登录结果异常。');el('password').value='';el('login').hidden=true;el('actions').hidden=false;await check();}catch(error){message(error.message,true);}finally{button.disabled=false;}});
+el('prepare').addEventListener('click',()=>action(async()=>{message('正在核对固定数量、余额和收益归属…');render(await api('preview',{coin:'USDGO',amount:fixed.amount,holding_id:fixed.holding_id}));message('清单已生成，尚未正式并入。');}));
+el('check').addEventListener('click',()=>action(check));el('ack').addEventListener('change',controls);
+el('confirm').addEventListener('click',()=>action(async()=>{if(!current||!el('ack').checked||(current.status!=='confirmation_pending'&&Date.now()>=current.expires_at))throw new Error('请重新生成清单并核对。');const hash=current.review_hash;el('ack').checked=false;message('正在提交本次明确确认，请等待结果；如网络中断，请查询本批状态。');try{showReceipt(await api('confirm',{review_hash:hash,coin:'USDGO',amount:fixed.amount,holding_id:fixed.holding_id}));}catch(error){try{const result=await check();if(result.record)return;}catch(_){}throw error;}}));
+setInterval(controls,1000);
+</script>
+</html>

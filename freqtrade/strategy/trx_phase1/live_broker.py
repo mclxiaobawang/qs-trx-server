@@ -29,8 +29,10 @@ from freqtrade.strategy.trx_phase1.request_limits import (
 COINS = ("USDT", "USDGO", "TRX")
 SYMBOLS = {"TRXUSDT": "TRX", "USDGOUSDT": "USDGO"}
 GET_PATHS = {
+    "v2/earn/account/assets",
     "v2/public/time",
     "v2/spot/account/info",
+    "v2/spot/account/deduct-info",
     "v2/spot/account/assets",
     "v2/spot/account/bills",
     "v2/spot/public/symbols",
@@ -105,15 +107,12 @@ class ClassicTransport:
         self._write_permit = None
 
     def reserve_write(self, path, lifetime):
+        # Preflight freezes only the original deadline. Consuming a redemption
+        # slot here would spend its 61-second budget before durable journal I/O.
         self._write_permit = None
         if lifetime <= 0:
             raise WriteNotSent("request_rate_wait")
-        started = self.limiter.clock()
-        try:
-            self.limiter.acquire(path, self.credential, priority=1, write=True)
-        except RateLimitWait:
-            raise WriteNotSent("request_rate_wait") from None
-        self._write_permit = (path, min(started + lifetime, self.limiter.clock() + 0.05))
+        self._write_permit = (path, self.limiter.clock() + lifetime)
 
     def sync_clock(self):
         server = int(self.call("GET", "v2/public/time")["serverTime"])
@@ -146,7 +145,18 @@ class ClassicTransport:
                 if self._write_permit is None:
                     self.reserve_write(path, 10)
                 permit, self._write_permit = self._write_permit, None
-                if permit[0] != path or self.limiter.clock() >= permit[1]:
+                remaining = permit[1] - self.limiter.clock()
+                if permit[0] != path or remaining <= 0:
+                    raise WriteNotSent("request_rate_wait")
+                # The sending intent is durable before this call. Admit exactly
+                # once immediately before HTTP; never renew a consumed redeem
+                # slot and never retry an HTTP request with an unknown outcome.
+                try:
+                    self.limiter.acquire(path, self.credential, priority=1,
+                                         write=True, max_wait=min(0.5, remaining))
+                except RateLimitWait:
+                    raise WriteNotSent("request_rate_wait") from None
+                if self.limiter.clock() >= permit[1]:
                     raise WriteNotSent("request_rate_wait")
             else:
                 try:
@@ -304,6 +314,14 @@ class ClassicBroker:
             values["restricted"] = restricted
             result[coin] = {k: str(v) for k, v in values.items()}
         return result
+
+    def require_bgb_deduction_off(self):
+        """Never infer fee currency from a quoted rate or a BGB balance."""
+        row = self.get("v2/spot/account/deduct-info")
+        if not isinstance(row, dict) or row.get("deduct") not in {"on", "off"}:
+            raise ExecutionError("bgb_deduction_status_unverified")
+        if row["deduct"] != "off":
+            raise ExecutionError("disable_bgb_deduction_before_start")
 
     def pages(self, path, params, *, list_key=None, cursor_key, limit=100, unique_keys=None):
         params = {**params, "limit": str(limit)}

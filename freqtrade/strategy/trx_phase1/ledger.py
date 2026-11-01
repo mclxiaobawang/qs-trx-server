@@ -3,7 +3,7 @@ import sqlite3
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 
@@ -47,6 +47,7 @@ class Ledger:
         self.realized = money(0)
         self.stable_interest = money(0)
         self.fx_profit = money(0)
+        self.withdrawn_usdgo_profit = money(0)
         self.external_flows = money(0)
         self.fund_units = self.initial
         self.fees = money(0)
@@ -329,6 +330,27 @@ class Ledger:
         self.external_flows += amount
         self.events.add(event_id)
 
+    def withdraw_usdgo(self, event_id, amount, price, fx):
+        """Remove owned spot capital at NAV; retained valuation profit is not new cash."""
+        if event_id in self.events:
+            return
+        with localcontext() as context:
+            context.prec = 50
+            amount, price, fx = map(money, (amount, price, fx))
+            if not 0 < amount <= self.usdgo - self.locked["USDGO"] or min(price, fx) <= 0:
+                raise ValueError("Withdrawal exceeds available USDGO")
+            equity, value = self.equity(price, fx), amount * fx
+            if equity <= value or self.deployable <= value or self.fund_units <= 0:
+                raise ValueError("Withdrawal requires positive remaining capital")
+            cost = self.usdgo_cost * amount / self.usdgo
+            self.fund_units *= (equity - value) / equity
+            self.external_flows -= value
+            self.usdgo -= amount
+            self.usdgo_cost -= cost
+            self.withdrawn_usdgo_profit += value - cost
+            self.usdgo_mark = fx
+            self.events.add(event_id)
+
     def queue_fee_rebate(self, fill_id, amount, due_at):
         amount = money(amount)
         row = next(fill for fill in self.orders if fill["id"] == fill_id)
@@ -510,6 +532,7 @@ class Ledger:
             "unrealized_profit": float(self.principal * money(price) - self.cost),
             "stable_interest": float(self.stable_interest),
             "fx_profit": float(self.fx_profit),
+            "withdrawn_usdgo_profit": float(self.withdrawn_usdgo_profit),
             "total_profit": float(equity - self.initial - self.external_flows),
             "return_ratio": float(equity / self.fund_units - 1) if self.fund_units else 0,
             "fees": float(self.fees - self.fee_rebates),
@@ -533,6 +556,7 @@ class Ledger:
                 "realized",
                 "stable_interest",
                 "fx_profit",
+                "withdrawn_usdgo_profit",
                 "external_flows",
                 "fund_units",
                 "fees",
@@ -553,6 +577,7 @@ class Ledger:
     @classmethod
     def restore(cls, state):
         book = cls(state["initial"])
+        book.withdrawn_usdgo_profit = money(state.get("withdrawn_usdgo_profit", "0"))
         for key in (
             "cash",
             "usdgo_cost",

@@ -54,6 +54,7 @@ READ_PATHS = frozenset(
         "v2/earn/savings/product",
         "v2/earn/savings/subscribe-info",
         "v2/earn/savings/records",
+        "v2/earn/account/assets",
     }
 )
 
@@ -171,6 +172,16 @@ def mask_uid(value):
     if not value.isdigit():
         raise AccountReadError("invalid_exchange_response")
     return "****" + value[-4:]
+
+
+def registration_time(value, now):
+    # Invalid/missing registration time cannot establish an all-age lower bound.
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    if not str(value).isdigit():
+        return None
+    stamp = int(value)
+    return stamp if 0 < stamp <= now else None
 
 
 def normalize_balances(data, uta=False):
@@ -295,7 +306,7 @@ def normalize_fill(row, uta=False, symbol="TRXUSDT"):
     }
 
 
-def normalize_savings(row):
+def normalize_savings(row, *, include_historical_profit=True):
     coin = row["productCoin"]
     if coin not in COINS or row["periodType"] != "flexible":
         return None
@@ -305,7 +316,7 @@ def normalize_savings(row):
         "coin": coin,
         "interest_coin": str(row["interestCoin"])[:20],
         "quantity": decimal_text(row["holdAmount"]),
-        "total_profit": decimal_text(row["totalProfit"]),
+        "total_profit": decimal_text(row["totalProfit"]) if include_historical_profit else None,
         "status": str(row["status"])[:40],
     }
 
@@ -410,8 +421,19 @@ def normalize_product_terms(data):
 
 
 class AccountReader:
-    def __init__(self, client, settings: AccountSettings, now_ms, clock_ms=None):
+    def __init__(
+        self,
+        client,
+        settings: AccountSettings,
+        now_ms,
+        clock_ms=None,
+        *,
+        account_created_at=None,
+        current_positions_only=False,
+    ):
         self.client, self.settings, self.now = client, settings, now_ms
+        self.account_created_at = account_created_at
+        self.current_positions_only = current_positions_only
         self.clock_ms = clock_ms or (lambda: now_ms)
         self.deadline = time.monotonic() + 75
         self._uta_fills = None
@@ -453,6 +475,10 @@ class AccountReader:
                     ),
                     funding_records=self.funding_records,
                 )
+        skipped = ("fills", "conversion_fills", "savings_records", "funding_records")
+        if self.current_positions_only:
+            for name in skipped:
+                sections.pop(name, None)
         data, checks = {}, {}
         for section, read in sections.items():
             try:
@@ -473,6 +499,8 @@ class AccountReader:
                     "error": error,
                 }
         for section in (
+            "fills",
+            "conversion_fills",
             "savings",
             "products",
             "savings_records",
@@ -482,9 +510,16 @@ class AccountReader:
             if section not in checks:
                 data[section] = None
                 checks[section] = {
-                    "status": "not_applicable" if self.settings.include_earn else "disabled",
+                    "status": "excluded_before_start"
+                    if self.current_positions_only and section in skipped
+                    else "not_applicable"
+                    if self.settings.include_earn
+                    else "disabled",
                     "error": None,
                 }
+        data["history_scope"] = (
+            "current_positions_only" if self.current_positions_only else "account_history"
+        )
         return data, checks
 
     def prices(self):
@@ -593,6 +628,10 @@ class AccountReader:
         }
 
     def savings(self):
+        if self.account_created_at is not None and self.settings.account_type == "classic":
+            from freqtrade.strategy.trx_phase1.account_savings import full_savings_holdings
+
+            return full_savings_holdings(self, self.account_created_at)
         # Bitget limits assets queries by order creation time to three months.
         # Report that coverage explicitly; old positions must not silently become 0.
         params = {
@@ -859,10 +898,12 @@ class AccountService:
                     else "connected",
                 )
                 if settings.include_earn:
-                    states = [
-                        self._checks.get(name, {}).get("status")
-                        for name in ("savings", "products", "savings_records")
-                    ]
+                    names = (
+                        ("savings", "products")
+                        if self._snapshot.get("history_scope") == "current_positions_only"
+                        else ("savings", "products", "savings_records")
+                    )
+                    states = [self._checks.get(name, {}).get("status") for name in names]
                     base["earn_access"]["status"] = (
                         "read_confirmed"
                         if all(state == "success" for state in states)
@@ -879,7 +920,7 @@ class AccountService:
         with self._state_lock:
             return self.status(), self._account_id
 
-    def refresh(self):
+    def refresh(self, *, current_positions_only=None):
         if not self._refresh_lock.acquire(blocking=False):
             raise AccountBusy("refresh_in_progress")
         client = None
@@ -921,12 +962,22 @@ class AccountService:
                 "completed_at": None,
                 "account": {
                     "uid_masked": mask_uid(info["userId"]),
+                    "registered_at": registration_time(info.get("regisTime"), now),
                     "permission_type": info.get("permType")
                     if info.get("permType") in ("read-only", "read-and-write")
                     else "unknown",
                 },
             }
-            reader = AccountReader(client, settings, now, lambda: int(self.clock() * 1000))
+            reader = AccountReader(
+                client,
+                settings,
+                now,
+                lambda: int(self.clock() * 1000),
+                account_created_at=snapshot["account"]["registered_at"],
+                current_positions_only=self.current_positions_only()
+                if current_positions_only is None
+                else current_positions_only,
+            )
             data, checks = reader.collect()
             snapshot.update(data)
             snapshot["completed_at"] = int(self.clock() * 1000)
@@ -949,6 +1000,14 @@ class AccountService:
                     client.close()
             self._refresh_lock.release()
         return self.status()
+
+    def current_positions_only(self):
+        """The adopted account does not need pre-start income or fill history."""
+        path = self.config_path.parent / "live-strategy-control.json"
+        if not path.exists():
+            return False
+        control = json.loads(path.read_text())
+        return control.get("allocation_mode") == "existing_positions_market_value_v1"
 
     def _record_observation(self, account_type, snapshot, timestamp):
         try:

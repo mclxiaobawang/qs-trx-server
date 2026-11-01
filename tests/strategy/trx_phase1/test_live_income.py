@@ -184,3 +184,11 @@ def test_unmapped_history_id_does_not_block_a_proven_account_credit(runtime):
     assert Ledger.restore(runtime.status()["book"]).interest_trx == 0
     assert len(runtime.status()["pending_income"]) == 1
     assert runtime.import_interest(NOW + 12000) == 0
+
+
+def test_usdt_interest_without_explicit_external_scope_still_requires_review(runtime):
+    before = runtime.status()
+    batch_credit(runtime.broker, "USDT", ".00026979", NOW + 1000)
+    with pytest.raises(ExecutionError, match="wallet_reconciliation_required"):
+        runtime.import_interest(NOW + 2000)
+    assert runtime.status() == before

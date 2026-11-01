@@ -117,6 +117,9 @@ def dashboard(state, engine, execution, book, now):
             "target_fraction": str(fraction) if p75 is not None else None,
         }
 
+    from .range_display import apply_range_signal
+
+    apply_range_signal(signal, state, engine, now)
     # Locked Earn principal is available to the planner only after a mapped redemption.
     planning = deepcopy(book)
     mapped = {}
@@ -138,7 +141,7 @@ def dashboard(state, engine, execution, book, now):
                 sum((money(row["quantity"]) for row in eligible), money(0))
             )
     signal["principal_location_verified"] = location_verified
-    if fx:
+    if fx and fx.get("fee") is not None:
         fee = money(fx["fee"])
         available = book.free_cash + book.usdgo * money(fx["bid"]) * (1 - fee) / (1 + fee)
         signal["redeemable_cash_estimate"] = str(available)
@@ -166,6 +169,8 @@ def dashboard(state, engine, execution, book, now):
         outside = money(execution.get("unassigned_offsets", {}).get(coin, 0)) + sum(
             (money(h.get("unassigned_amount", 0)) for h in holdings), money(0)
         )
+        from .live_reserve import protected_spot
+
         locations.append(
             {
                 "coin": coin,
@@ -176,6 +181,10 @@ def dashboard(state, engine, execution, book, now):
                 "earn": str(earn),
                 "other_locked": str(locked - earn),
                 "outside_strategy": str(outside),
+                "reserved_earn": str(
+                    sum((money(h.get("reserved_amount", 0)) for h in holdings), money(0))
+                ),
+                "reserved_spot": str(protected_spot(execution)) if coin == "USDGO" else "0",
                 "consistent": 0 <= earn <= locked <= total,
             }
         )
@@ -190,6 +199,7 @@ def dashboard(state, engine, execution, book, now):
             "interest_sale_proceeds": str(book.interest_sale_proceeds),
             "stable_interest": str(book.stable_interest),
             "fx_realized": str(book.fx_profit),
+            "withdrawn_usdgo_profit": str(book.withdrawn_usdgo_profit),
             "usdgo_unrealized": str(book.usdgo * money(fx["bid"]) - book.usdgo_cost) if fx else "0",
         }
         total = book.equity(price) - book.initial - book.external_flows

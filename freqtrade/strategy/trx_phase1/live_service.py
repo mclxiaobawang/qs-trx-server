@@ -27,6 +27,7 @@ from freqtrade.strategy.trx_phase1.live_execution import (
 )
 from freqtrade.strategy.trx_phase1.live_funding import LiveFunding
 from freqtrade.strategy.trx_phase1.live_strategy import LiveStrategy
+from freqtrade.strategy.trx_phase1.price_position import build_price_reference
 from freqtrade.strategy.trx_phase1.request_limits import RequestLimiter
 from freqtrade.strategy.trx_phase1.shadow_market import (
     PublicShadowMarket,
@@ -326,6 +327,8 @@ class LiveService:
             )
             or "ready"
         )
+        if control and control.get("trading_authorized") is False:
+            status = "adopted_trading_not_authorized"
         return {
             "status": status,
             "ready": status == "ready",
@@ -414,13 +417,25 @@ class LiveService:
                     "last_close",
                 )
             }
-            state["effective_config"] = engine["config"]
+            from .range_display import display_config, range_view
+
+            state["effective_config"] = display_config(state, engine, self.clock())
+            state["active_range_policy"] = range_view(state, engine, self.clock())
+            if control.get("allocation_mode") == "existing_positions_market_value_v1":
+                state["performance"] = {
+                    "status": "started" if state.get("performance_basis") else "not_started",
+                    "started_at": (state.get("performance_basis") or {}).get("started_at"),
+                    "basis": "actual_strategy_start_market_value",
+                    "previous_adoption_is_performance_basis": False,
+                }
             from freqtrade.strategy.trx_phase1.live_observation import dashboard
 
             state["dashboard"] = dashboard(state, engine, execution, book, self.clock())
             from freqtrade.strategy.trx_phase1.income_allocation import summary as income_summary
+            from freqtrade.strategy.trx_phase1.live_reserve import summary as reserve_summary
 
             state["execution"] = {
+                "usdgo_reserve": reserve_summary(execution),
                 "flow": execution["flow"],
                 "operation": execution["operation"],
                 "holdings": execution["holdings"],
@@ -431,6 +446,8 @@ class LiveService:
                 "pending_income": execution.get("pending_income", {}),
                 "income_accounting": income_summary(execution.get("income_accounting")),
                 "asset_contributions": list(execution.get("asset_contributions", {}).values()),
+                "asset_withdrawals": list(execution.get("asset_withdrawals", {}).values()),
+                "withdrawal_enabled": True,
                 "quarantined_account_credits": list(
                     execution.get("quarantined_account_credits", {}).values()
                 )[-30:],
@@ -450,6 +467,73 @@ class LiveService:
             )
             return result
 
+    def selected_contribution(self, review_hash=None, selection=None, status_only=False):
+        """One fixed old-account batch, serialized with the running strategy."""
+        from freqtrade.strategy.trx_phase1 import live_contribution
+        from freqtrade.strategy.trx_phase1.selected_contribution import (
+            CoreRejected,
+            SelectedContribution,
+            SelectedContributionError,
+            fixed_policy,
+        )
+
+        with self.lock:
+            control = self.load()
+            if not control:
+                raise ExecutionError("existing_live_account_required")
+            runtime = self.get_runtime(control)
+            with runtime.lock:
+                if self.credential_identity() != control["credentials_identity"]:
+                    raise ExecutionError("credentials_changed_requires_preflight")
+                reader = self.broker_factory(False)
+                try:
+                    execution = LiveExecution(self.root, reader, control["account_id"])
+
+                    class NativeWriter:
+                        def confirm(writer, selected_hash, _authorization):
+                            try:
+                                return live_contribution.apply(
+                                    execution, selected_hash, self.clock()
+                                )
+                            except ExecutionError as exc:
+                                raise CoreRejected(str(exc)) from None
+
+                    helper = SelectedContribution(
+                        fixed_policy(execution.root), core=NativeWriter(), clock=self.clock
+                    )
+                    if status_only:
+                        return helper.status()
+                    if (
+                        not runtime.state["startup_complete"]
+                        or runtime.state["intent"]
+                        or runtime.engine.pending
+                        or runtime.state["error"]
+                        or runtime.state["phase"] not in {"observing", "paused", "prepared"}
+                    ):
+                        raise ExecutionError("contribution_requires_idle_strategy")
+                    helper.selection(selection)
+                    result = (
+                        helper.confirm(review_hash, None)
+                        if review_hash
+                        else helper.prepare(selection)
+                    )
+                    runtime.execution.reload()
+                    if review_hash:
+                        funding = LiveFunding(
+                            runtime.execution.state,
+                            runtime.engine.config,
+                            runtime.state["markets"],
+                            runtime.state["terms"],
+                        )
+                        runtime.sync_book(funding)
+                        runtime.persist()
+                    return result
+                except SelectedContributionError as exc:
+                    raise ExecutionError(str(exc)) from None
+                finally:
+                    runtime.execution.reload()
+                    self.close_broker(reader)
+
     def contribution(self, review_hash=None):
         """Preview is read-only at the exchange; applying requires an explicit review hash."""
         from freqtrade.strategy.trx_phase1 import live_contribution
@@ -460,6 +544,10 @@ class LiveService:
                 raise ExecutionError("existing_live_account_required")
             runtime = self.get_runtime(control)
             with runtime.lock:
+                from freqtrade.strategy.trx_phase1.live_withdrawal import active
+
+                if active(runtime.execution.status()):
+                    raise ExecutionError("withdrawal_already_pending")
                 if (
                     not runtime.state["startup_complete"]
                     or runtime.state["intent"]
@@ -495,6 +583,77 @@ class LiveService:
                 finally:
                     runtime.execution.reload()
                     self.close_broker(reader)
+
+    def reserve_half(self, account_id, allocation_id):
+        """Explicit one-time ownership change; the broker is read-only."""
+        from freqtrade.strategy.trx_phase1.live_reserve import allocate_half
+
+        with self.lock:
+            control = self.load()
+            if not control or control["account_id"] != account_id:
+                raise ExecutionError("account_binding_mismatch")
+            runtime = self.get_runtime(control)
+            with runtime.lock:
+                if self.credential_identity() != control["credentials_identity"]:
+                    raise ExecutionError("credentials_changed_requires_preflight")
+                saved = runtime.execution.status().get("usdgo_reserve")
+                if saved:
+                    if saved["allocation_id"] != allocation_id:
+                        raise ExecutionError("reserve_already_allocated")
+                    return deepcopy(saved)
+                if not runtime.thread or not runtime.thread.is_alive():
+                    raise ExecutionError("reserve_requires_running_worker")
+                reader = self.broker_factory(False)
+                try:
+                    execution = LiveExecution(self.root, reader, account_id)
+                    state = {**runtime.state, "engine": runtime.engine.state()}
+                    result = allocate_half(execution, state, allocation_id, self.clock())
+                    runtime.execution.reload()
+                    runtime.sync_book(
+                        LiveFunding(
+                            runtime.execution.state,
+                            runtime.engine.config,
+                            runtime.state["markets"],
+                            runtime.state["terms"],
+                        )
+                    )
+                    runtime.persist()
+                    return result
+                finally:
+                    runtime.execution.reload()
+                    self.close_broker(reader)
+
+    def withdrawal(self, amount=None, review_hash=None):
+        """Only a human confirmation queues a durable withdrawal for the current worker."""
+        from freqtrade.strategy.trx_phase1 import live_withdrawal
+
+        with self.lock:
+            control = self.load()
+            if not control:
+                raise ExecutionError("existing_live_account_required")
+            runtime = self.get_runtime(control)
+            with runtime.lock:
+                if self.credential_identity() != control["credentials_identity"]:
+                    raise ExecutionError("credentials_changed_requires_preflight")
+                # A repeated confirmation returns its existing receipt without new work.
+                if review_hash:
+                    saved = runtime.execution.status().get("asset_withdrawals", {}).get(review_hash)
+                    if saved:
+                        return deepcopy(saved)
+                    if (
+                        runtime.state["desired"] != "running"
+                        or not runtime.thread
+                        or not runtime.thread.is_alive()
+                    ):
+                        raise ExecutionError("withdrawal_requires_running_worker")
+                try:
+                    return (
+                        live_withdrawal.confirm(runtime, review_hash, self.clock())
+                        if review_hash
+                        else live_withdrawal.review(runtime, amount, self.clock())
+                    )
+                finally:
+                    runtime.execution.reload()
 
     def products(self):
         broker = self.broker_factory(False)
@@ -541,12 +700,41 @@ class LiveService:
         raise ExecutionError("finalized_market_data_stale")
 
     def check_existing_only(self):
+        if (self.load() or {}).get("trading_authorized") is False:
+            raise ExecutionError("adopted_trading_not_authorized")
         if self.existing_only:
             from freqtrade.strategy.trx_phase1.live_restore import existing_state
 
             existing_state(self)
 
+    def awaiting_existing_start(self, control):
+        return bool(
+            control
+            and control.get("allocation_mode") == "existing_positions_market_value_v1"
+            and not self.get_runtime(control).state.get("activated_at")
+        )
+
     def prepare(self, setup, *, expected_account_id=None):
+        with self.lock:
+            control = self.load()
+            self.recover_startup_control(control)
+            control = self.load()
+            if self.awaiting_existing_start(control):
+                with allocation_lock(self.root):
+                    return self.prepare_existing_start(setup, expected_account_id)
+            return self.prepare_allocated(setup, expected_account_id=expected_account_id)
+
+    def recover_startup_control(self, control):
+        """Finish an already committed start after a control-marker crash."""
+        if control and control.get("allocation_mode") == "existing_positions_market_value_v1":
+            basis = self.get_runtime(control).execution.status().get("performance_basis")
+            if basis and control.get("performance_basis_sha256") != basis["sha256"]:
+                from freqtrade.strategy.trx_phase1.startup_basis import commit
+
+                with allocation_lock(self.root):
+                    commit(self, None)
+
+    def prepare_allocated(self, setup, *, expected_account_id=None):
         with self.lock, allocation_lock(self.root):
             self.check_existing_only()
             if self.acceptance_pending():
@@ -561,6 +749,7 @@ class LiveService:
                 account_id = broker.account_id()
                 if expected_account_id is not None and account_id != expected_account_id:
                     raise ExecutionError("account_binding_mismatch")
+                broker.require_bgb_deduction_off()
                 control = self.load()
                 products = [p.model_dump(mode="json") for p in setup.products]
                 if control and (
@@ -637,6 +826,7 @@ class LiveService:
                 self.runtime = runtime
                 self.save(
                     {
+                        **(control or {}),
                         "account_id": account_id,
                         "source_sha256": digest(snapshot),
                         "setup": setup.model_dump(mode="json"),
@@ -644,12 +834,133 @@ class LiveService:
                         "reviewed_at": now,
                         "review_expires_at": now + 5 * 60000,
                         "credentials_identity": identity,
+                        **{
+                            key: control[key]
+                            for key in ("range_policy_sha256", "range_policy_activated_at")
+                            if control and key in control
+                        },
                     }
                 )
                 return self.status()
             finally:
                 self.close_broker(broker)
                 market.close()
+
+    def capture_startup(self):
+        from freqtrade.strategy.trx_phase1.account import AccountService
+        from freqtrade.strategy.trx_phase1.startup_basis import capture
+
+        return capture(AccountService(self.root.parent), self)
+
+    def prepare_existing_start(self, setup, expected_account_id=None):
+        """Fresh read-only preflight for an explicitly authorized adopted account.
+
+        Price and capital remain provisional here. The actual start captures them
+        again through this preflight and commits only after its review matches.
+        """
+        from freqtrade.strategy.trx_phase1.startup_basis import POLICY, documents
+
+        control = self.load()
+        if control.get("trading_authorized") is not True:
+            raise ExecutionError("adopted_trading_not_authorized")
+        if self.credential_identity() != control["credentials_identity"]:
+            raise ExecutionError("credentials_changed_requires_preflight")
+        if expected_account_id and expected_account_id != control["account_id"]:
+            raise ExecutionError("account_binding_mismatch")
+        setup = LiveSetup.model_validate(setup)
+        if setup.model_dump(mode="json")["products"] != control["setup"]["products"]:
+            raise ExecutionError("frozen_live_setup_mismatch")
+        runtime = self.get_runtime(control)
+        if runtime.thread and runtime.thread.is_alive():
+            raise ExecutionError("pause_strategy_before_preflight")
+        reader, market = self.broker_factory(False), self.market_factory()
+        try:
+            if reader.account_id() != control["account_id"]:
+                raise ExecutionError("account_binding_mismatch")
+            reader.require_bgb_deduction_off()
+            data = runtime.store.candles()
+            if data is None:
+                data = seed_history(
+                    self.seed, self.clock(), self.source()["price_position_lookback_days"]
+                )
+            data, now = self.confirmed_minutes(market, data)
+            if (
+                build_price_reference(data, ResearchConfig.from_saved(self.source())).value_at(now)
+                is None
+            ):
+                raise ExecutionError("complete_p75_history_required")
+            markets = {s: reader.market(s, now) for s in ("TRXUSDT", "USDGOUSDT")}
+            terms = {p.coin: reader.product(p.coin, p.product_id) for p in setup.products}
+            # Final exchange reads are the startup quantities and prices.
+            captured = self.capture_startup()
+            scratch, _ = documents(
+                captured, control, runtime.execution.status(), runtime.status(), self.source()
+            )
+            funding = LiveFunding(scratch, ResearchConfig.from_saved(self.source()), markets, terms)
+            for coin, term in terms.items():
+                if term["status"] != "in_progress" or not self.redemption_verified(
+                    funding.rules[coin].model_dump(mode="json"), control["account_id"]
+                ):
+                    raise ExecutionError("redemption_terms_unverified")
+            # Review the account/product scope and terms. Both quantities and
+            # prices are captured again at start, never frozen by a preview.
+            review = digest(
+                {
+                    "terms": terms_review(
+                        self.source(), setup.model_copy(update={"capital": "1"}), funding
+                    ),
+                    "scope": captured["scope_hash"],
+                    "policy": POLICY,
+                }
+            )
+            now = self.clock()
+            self._startup_capture, self._startup_data = captured, data
+            self.save(
+                {
+                    **control,
+                    "review_hash": review,
+                    "reviewed_at": now,
+                    "review_expires_at": now + 5 * 60000,
+                    "startup_scope_hash": captured["scope_hash"],
+                }
+            )
+            return self.status()
+        finally:
+            self.close_broker(reader)
+            market.close()
+
+    def start_existing_positions(self, review_hash):
+        from freqtrade.strategy.trx_phase1.startup_basis import commit
+
+        control = self.load()
+        self.prepare(control["setup"])
+        if self.load()["review_hash"] != review_hash:
+            raise ExecutionError("live_terms_changed_review_required")
+        writer = self.broker_factory(True)
+        market = None
+        try:
+            if writer.account_id() != control["account_id"]:
+                raise ExecutionError("account_binding_mismatch")
+            writer.require_bgb_deduction_off()
+            with allocation_lock(self.root):
+                basis = commit(self, self._startup_capture, review_hash=review_hash)
+            runtime = self.get_runtime(self.load())
+            market = self.market_factory()
+            runtime.execution.broker, runtime.market = writer, market
+            runtime.data = self._startup_data
+            runtime.store.add_candles(runtime.data)
+            runtime.initialize_indicators(basis["started_at"])
+            runtime.credential_guard = lambda: (
+                self.credential_identity() == control["credentials_identity"]
+            )
+            runtime.start()
+            self.save({**self.load(), "review_expires_at": 0})
+            return self.status()
+        except BaseException:
+            self.close_broker(writer)
+            if market is not None:
+                market.close()
+            raise
 
     @staticmethod
     def review_remaining_startup(runtime, funding, now):
@@ -712,20 +1023,28 @@ class LiveService:
     def start(self, review_hash):
         with self.lock:
             control = self.load()
+            if control and control.get("trading_authorized") is False:
+                raise ExecutionError("adopted_trading_not_authorized")
             if (
                 not control
                 or not secrets.compare_digest(review_hash, control["review_hash"])
                 or self.clock() >= control["review_expires_at"]
             ):
                 raise ExecutionError("fresh_preflight_required")
+            if self.awaiting_existing_start(control):
+                return self.start_existing_positions(review_hash)
             refreshed = self.prepare(control["setup"])
             current = self.load()
             if current["review_hash"] != review_hash:
                 raise ExecutionError("live_terms_changed_review_required")
             broker = self.broker_factory(True)
-            if broker.account_id() != current["account_id"]:
+            try:
+                if broker.account_id() != current["account_id"]:
+                    raise ExecutionError("account_binding_mismatch")
+                broker.require_bgb_deduction_off()
+            except BaseException:
                 self.close_broker(broker)
-                raise ExecutionError("account_binding_mismatch")
+                raise
             runtime = self.runtime
             runtime.execution.broker, runtime.market = broker, self.market_factory()
             expected = current["credentials_identity"]
@@ -754,6 +1073,8 @@ class LiveService:
             control = self.load()
             if not control:
                 raise ExecutionError("strategy_not_prepared")
+            if self.awaiting_existing_start(control):
+                raise ExecutionError("actual_start_required_before_reconciliation")
             runtime = self.get_runtime(control)
             if runtime.thread and runtime.thread.is_alive():
                 raise ExecutionError("pause_strategy_before_reconciliation")
@@ -783,7 +1104,8 @@ class LiveService:
                     runtime.sync_book(funding)
                     runtime.capture_observation(self.clock())
                 if runtime.state["phase"] == "blocked" and not runtime.state["intent"]:
-                    runtime.state.update(phase="paused", error=None)
+                    runtime.state.update(phase="paused", error=None, evidence_wait_started_at=None,
+                                         evidence_wait_last_seen_at=None)
                 runtime.persist()
                 return self.status()
             finally:

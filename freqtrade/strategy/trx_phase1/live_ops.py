@@ -14,10 +14,13 @@ from decimal import ROUND_DOWN
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from . import notification_receipts as receipts
 from .auto_rebate import read_status as rebate_status
 from .income_allocation import summary as income_summary
 from .ledger import Ledger, money
+from .live_indicators import indicator_snapshot
 from .live_observation import dashboard
+from .reconciliation_wait import pending_wait
 
 
 class ViewUnavailable(Exception):
@@ -131,7 +134,7 @@ def memory_usage(root=Path("/sys/fs/cgroup")):
         return None  # Non-cgroup hosts and unlimited budgets have no finite percentage.
 
 
-def trading_memory(path, now):
+def trading_memory(path, now, *, container_name="trx-phase1-live"):
     if path is None:
         return None
     try:
@@ -140,7 +143,7 @@ def trading_memory(path, now):
             raise ValueError()
         value = json.loads(path.read_text())
         if (
-            value.get("container_name") != "trx-phase1-live"
+            value.get("container_name") != container_name
             or value.get("error")
             or not value.get("running")
             or not -5000 <= now - value["checked_at"] <= 90000
@@ -484,6 +487,10 @@ class LiveView:
                 "terms",
             )
         }
+        result["reconciliation_wait"] = pending_wait(state, now, execution)
+        if result["reconciliation_wait"]:
+            result["persisted_error"] = result["error"]
+            result["error"] = None
         # Worker liveness remains the last explicit response from the trading API;
         # this reader reports persisted heartbeat freshness, never a fabricated thread state.
         result["summary"] = book.summary(
@@ -511,7 +518,11 @@ class LiveView:
                 "last_close",
             )
         }
-        result["effective_config"] = engine["config"]
+        from .range_display import display_config, range_view
+
+        result["effective_config"] = display_config(state, engine, now)
+        result["active_range_policy"] = range_view(state, engine, now)
+        result["indicators"] = indicator_snapshot(state, engine, book)
         times = [int(q["timestamp"]) for q in markets.values() if q.get("timestamp")]
         result["valuation"] = {
             "observed_at": min(times) if times else None,
@@ -521,10 +532,42 @@ class LiveView:
         result["decisions"] = state.get("decisions", [])[-10:]
         result["evaluations"] = state.get("evaluations", [])[-12:]
         result["dashboard"] = dashboard(state, engine, execution, book, now)
-        result["order_preview"] = preview(state, engine, execution, book, result["dashboard"], now)
+        adopted = bool(execution.get("opening_adoption"))
+        if adopted:
+            basis = execution.get("performance_basis")
+            result["performance"] = {
+                "status": "started" if basis else "not_started",
+                "started_at": (basis or {}).get("started_at"),
+                "basis": "actual_strategy_start_market_value",
+                "previous_adoption_is_performance_basis": False,
+            }
+        # An unused adopted account has only provisional bid/ask prices. It has
+        # no approved market fee/precision snapshot or executable order budget.
+        result["order_preview"] = (
+            {
+                "observed_at": None,
+                "fresh": False,
+                "basis": "awaiting_actual_strategy_start",
+                "buy": None,
+                "sell": None,
+            }
+            if adopted and not execution.get("performance_basis")
+            else preview(state, engine, execution, book, result["dashboard"], now)
+        )
         result["activity"] = activity_summary(execution, now)
         result["rebate_capital_automation"] = rebate_status(self.source, execution, now)
+        from .live_reserve import summary as reserve_summary
+
+        activity_rewards = {}
+        for credit in execution.get("quarantined_account_credits", {}).values():
+            if credit.get("type") == "ACTIVITY_ASSET_REWARD_USER_IN":
+                coin = credit["coin"]
+                activity_rewards[coin] = str(
+                    money(activity_rewards.get(coin, "0")) + money(credit["offset_delta"])
+                )
         result["execution"] = {
+            "activity_reward_totals": activity_rewards,
+            "usdgo_reserve": reserve_summary(execution),
             "flow": execution.get("flow"),
             "operation": execution.get("operation"),
             "holdings": execution.get("holdings", {}),
@@ -535,6 +578,8 @@ class LiveView:
             "pending_income": execution.get("pending_income", {}),
             "income_accounting": income_summary(execution.get("income_accounting")),
             "asset_contributions": list(execution.get("asset_contributions", {}).values()),
+            "asset_withdrawals": list(execution.get("asset_withdrawals", {}).values()),
+            "withdrawal_enabled": bool(state.get("withdrawal_enabled")),
             "quarantined_account_credits": list(
                 execution.get("quarantined_account_credits", {}).values()
             )[-30:],
@@ -566,13 +611,7 @@ def send_notification(config, subject, body):
         raise ValueError("telegram_token_invalid")
     request = Request(
         "https://api.telegram.org/bot" + token + "/sendMessage",
-        data=json.dumps(
-            {
-                "chat_id": config["chat_id"],
-                "text": subject + "\n" + body,
-                "disable_web_page_preview": True,
-            }
-        ).encode(),
+        data=json.dumps(receipts.send_payload(config, subject, body)).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -580,6 +619,16 @@ def send_notification(config, subject, body):
         result = json.loads(response.read(65536))
     if result.get("ok") is not True:
         raise ValueError("telegram_delivery_unconfirmed")
+    if config.get("_notification_callback"):
+        message = result.get("result", {})
+        message_id = message.get("message_id")
+        if (
+            type(message_id) is not int
+            or message_id <= 0
+            or str((message.get("chat") or {}).get("id")) != str(config["chat_id"])
+        ):
+            raise ValueError("telegram_delivery_unconfirmed")
+        return {"message_id": message_id}
     return True
 
 
@@ -593,12 +642,14 @@ class Operations:
         notification_file=None,
         clock=None,
         resource_file=None,
+        trading_container_name="trx-phase1-live",
     ):
         self.view, self.database = view, Path(database)
         self.backup_status, self.disk_path = Path(backup_status), disk_path
         self.notification_file = Path(notification_file) if notification_file else None
         self.clock = clock or (lambda: int(time.time() * 1000))
         self.resource_file = Path(resource_file) if resource_file else None
+        self.trading_container_name = trading_container_name
         self.database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS ops_state(id INTEGER PRIMARY KEY,payload TEXT)")
@@ -621,6 +672,7 @@ class Operations:
                 "CREATE TABLE IF NOT EXISTS strategy_lifecycle("
                 "account_id TEXT PRIMARY KEY,payload TEXT NOT NULL)"
             )
+            receipts.migrate(db)
         self.database.chmod(0o600)
 
     def notification(self):
@@ -735,11 +787,13 @@ class Operations:
             row = db.execute("SELECT payload FROM ops_state WHERE id=1").fetchone()
             pending = db.execute(
                 "SELECT count(*) FROM notifications "
-                "WHERE delivery_state IN ('pending','unknown','sending')"
+                "WHERE delivery_state IN ('pending','unknown','sending') "
+                "AND acknowledged_at IS NULL"
             ).fetchone()[0]
         with closing(sqlite3.connect(self.database)) as db:
             unconfirmed = db.execute(
-                "SELECT count(*) FROM notifications WHERE delivery_state IN ('sending','unknown')"
+                "SELECT count(*) FROM notifications WHERE delivery_state IN ('sending','unknown') "
+                "AND acknowledged_at IS NULL"
             ).fetchone()[0]
             baseline = db.execute(
                 "SELECT baseline_at FROM trade_notification_accounts WHERE account_id=?",
@@ -757,8 +811,16 @@ class Operations:
             "pending": pending,
             "last_error": "telegram_delivery_unconfirmed"
             if unconfirmed
-            else value.get("notification_error"),
+            else (
+                None
+                if value.get("notification_error") == "telegram_delivery_unconfirmed"
+                else value.get("notification_error")
+            ),
         }
+        value["notification"]["unconfirmed_messages"] = receipts.public_rows(
+            self, limit=5, unresolved=True
+        )["items"]
+        value["notification"]["details_url"] = "/notifications"
         value.pop("notification_error", None)
         value["trade_notifications"] = {
             "baseline_at": baseline[0] if baseline else None,
@@ -780,7 +842,7 @@ class Operations:
             self.observe_trades(execution, now)
             self.observe_lifecycle(execution, state, now)
             running = state.get("desired") == "running"
-            if state.get("error"):
+            if state.get("error") and not pending_wait(state, now, execution):
                 alarm("strategy_error", "策略报告运行异常，请查看真实账户页面。", "critical")
             if running:
                 checks = (
@@ -832,7 +894,9 @@ class Operations:
                 "独立告警容器内存占用达到80%，请核对资源预算；策略未被暂停。",
                 "critical" if memory["percent"] >= 90 else "warning",
             )
-        trading = trading_memory(self.resource_file, now)
+        trading = trading_memory(
+            self.resource_file, now, container_name=self.trading_container_name
+        )
         if trading and trading.get("available") is False:
             alarm("trading_memory_unavailable", "交易容器内存指标缺失、过期或读取失败。")
         elif trading and trading["percent"] >= 80:
@@ -857,6 +921,7 @@ class Operations:
         previous = {a["code"]: a for a in old["alerts"]}
         alerts = []
         result = {
+            "reconciliation_wait": pending_wait(state or {}, now, execution),
             "checked_at": now,
             "alerts": alerts,
             "backup": backup,
@@ -954,7 +1019,14 @@ class Operations:
                 except (ViewUnavailable, KeyError, TypeError, ValueError):
                     current = "暂时无法读取，请查看实盘运行页面"
             title, message = notification_content(row[1], row[2], item, row[4], current)
-            send_notification(config, title, message)
+            config = receipts.prepare(self, row[0], config, title, message)
+            receipt = send_notification(config, title, message)
+            if config.get("_notification_callback"):
+                with closing(sqlite3.connect(self.database)) as db, db:
+                    db.execute(
+                        "UPDATE notifications SET telegram_message_id=? WHERE id=?",
+                        (receipt["message_id"], row[0]),
+                    )
         except Exception:
             # Never expose API responses, bot tokens or recipient IDs.
             error = "telegram_delivery_unconfirmed"

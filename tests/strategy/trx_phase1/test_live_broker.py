@@ -45,6 +45,32 @@ def request_body():
     }
 
 
+@pytest.mark.parametrize("status", ["on", None, "unknown"])
+def test_startup_fee_currency_gate_fails_closed(transport, status):
+    transport.writes_enabled = False
+    transport.session.request.return_value.json = lambda: {
+        "code": "00000",
+        "data": {"deduct": status},
+    }
+    broker = ClassicBroker(transport)
+    with pytest.raises(ExecutionError, match=r"disable_bgb|status_unverified"):
+        broker.require_bgb_deduction_off()
+    assert all(c.args[0] == "GET" for c in transport.session.request.call_args_list)
+
+
+def test_startup_fee_currency_gate_reads_switch_even_with_no_bgb(transport):
+    transport.writes_enabled = False
+    transport.session.request.return_value.json = lambda: {
+        "code": "00000",
+        "data": {"deduct": "off"},
+    }
+    ClassicBroker(transport).require_bgb_deduction_off()
+    assert transport.session.request.call_args.args == (
+        "GET",
+        "https://api.bitget.com/api/v2/spot/account/deduct-info",
+    )
+
+
 def test_empty_bill_window_is_local_instead_of_an_invalid_exchange_query(transport):
     broker = ClassicBroker(transport)
     assert broker.bills("TRX", 1792166400000, 1792166400000) == []

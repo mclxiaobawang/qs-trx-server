@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>USDGO 追加本金只读预览</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;margin:32px auto;max-width:1080px;padding:0 22px;color:#193044;background:#fff;line-height:1.7}h1{font-size:27px}h2{font-size:21px;margin-top:28px}.note{padding:14px 18px;background:#eef6ff;border-left:4px solid #347bb9}.good{background:#edf7f1;border-left-color:#268557}form{display:flex;flex-wrap:wrap;gap:14px;align-items:end;margin:22px 0}label{display:flex;flex-direction:column;gap:5px;font-size:14px}input,select,button{font:inherit;border:1px solid #bdcbd5;border-radius:6px;padding:9px 12px}button{background:#176aa3;color:#fff;border-color:#176aa3;cursor:pointer}button:disabled{opacity:.6;cursor:wait}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{padding:16px;border:1px solid #dce5eb;border-radius:8px}.card strong{font-size:22px;display:block;font-weight:500}.card span,small{color:#617283}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:11px;border-bottom:1px solid #dce5eb;text-align:left;white-space:nowrap}th{background:#f4f7f9}#status{min-height:28px;color:#526a7d}.error{color:#b63932!important}[hidden]{display:none!important}@media(max-width:650px){body{margin:20px auto;padding:0 15px}.cards{grid-template-columns:1fr}h1{font-size:23px}form label,input{width:100%;box-sizing:border-box}}
+</style>
+<h1>USDGO 追加本金只读预览</h1>
+<div class="note">仅从选定的 USDGO 理财持仓选择金额。当前策略继续运行；本页不会正式并入、赎回、申购或下单。</div>
+<form id="login">
+  <label>旧网站登录账号<input id="username" autocomplete="username" required></label>
+  <label>登录密码<input id="password" type="password" autocomplete="current-password" required></label>
+  <button>登录并读取预览</button>
+</form>
+<form id="selection" hidden>
+  <label>追加币种<select id="coin"><option value="USDGO">USDGO</option></select></label>
+  <label>追加数量<input id="amount" inputmode="decimal" required pattern="\d{1,15}(\.\d{1,8})?" placeholder="最多 8 位小数"></label>
+  <button>刷新只读预览</button>
+</form>
+<p id="status" role="status"></p>
+<main id="result" hidden>
+  <div class="note good">尚未正式并入。以下“假设追加后”数值只用于核对。</div>
+  <p id="snapshot"></p>
+  <div class="cards">
+    <div class="card"><span>本次选择 USDGO</span><strong id="quantity"></strong></div>
+    <div class="card"><span>追加本金估值（USDT）</span><strong id="capital"></strong></div>
+    <div class="card"><span>假设追加后的买入预算（USDT）</span><strong id="budget"></strong></div>
+  </div>
+  <h2>本金、预算与收益口径</h2>
+  <div class="table"><table><thead><tr><th>核对项目</th><th>当前策略</th><th>假设追加后</th></tr></thead><tbody id="comparison"></tbody></table></div>
+  <p id="budget-note"></p>
+  <h2>资金来源与未选择的资产</h2>
+  <p id="source"></p>
+  <div class="table"><table><thead><tr><th>位置</th><th>币种</th><th>本次预览后仍在策略外</th></tr></thead><tbody id="excluded"></tbody></table></div>
+  <h2>利息归属</h2>
+  <p id="interest"></p>
+  <p>追加前和过渡计息小时仍沿用原归属；即使之后才到账，也不会补记为策略收益。原有策略收益继续累计，原 TRX 成本与收益起点保留。</p>
+  <p><small>本页使用最近一轮已对账的账户和行情快照。估值及预算会随报价变化，正式并入前需要重新核对数量、价格和归属时间。</small></p>
+</main>
+<script>
+let token = '';
+const byId = id => document.getElementById(id);
+const query = new URLSearchParams(location.search);
+byId('amount').value = query.get('amount') || '';
+const number = (value, digits=4) => Number(value).toLocaleString('zh-CN', {minimumFractionDigits:digits, maximumFractionDigits:digits});
+const date = value => new Intl.DateTimeFormat('zh-CN', {timeZone:'Asia/Shanghai', dateStyle:'short', timeStyle:'medium', hour12:false}).format(new Date(value));
+function row(target, cells) {
+  const tr=document.createElement('tr');
+  for(const value of cells){const td=document.createElement('td');td.textContent=value;tr.appendChild(td);}
+  byId(target).appendChild(tr);
+}
+function status(text, bad=false){byId('status').textContent=text;byId('status').className=bad?'error':'';}
+function render(data){
+  if(!data.preview_only || data.execution_enabled) throw new Error('预览模式异常，请停止操作。');
+  const a=data.before,b=data.after,s=data.selection;
+  byId('quantity').textContent=number(s.amount,8);
+  byId('capital').textContent=number(s.value_usdt);
+  byId('budget').textContent=number(b.buy.target_budget_usdt);
+  byId('snapshot').textContent=`数据时间：${date(data.observed_at)}（上海）；本次假设归属时点：${date(data.created_at)}。`;
+  byId('comparison').replaceChildren();
+  for(const [label,key,digits] of [['初始本金（USDT）','initial_capital_usdt',4],['累计净投入本金（USDT）','net_capital_usdt',4],['策略 USDGO 数量','usdgo_quantity',8],['USDGO 持仓成本（USDT）','usdgo_cost_usdt',4],['TRX 持仓成本（USDT）','trx_cost_usdt',4],['累计净利润（USDT）','profit_usdt',6],['基金份额','fund_units',8],['单位净值','nav',12]]) row('comparison',[label,number(a[key],digits),number(b[key],digits)]);
+  row('comparison',['可部署资金基数（USDT）',number(a.buy.capital_base_usdt),number(b.buy.capital_base_usdt)]);
+  row('comparison',['买入预算估算（USDT）',number(a.buy.target_budget_usdt),number(b.buy.target_budget_usdt)]);
+  byId('budget-note').textContent=`沿用原买入比例 ${number(Number(b.buy.base_fraction)*100,2)}%，P75 倍率 ${number(b.buy.p75_multiplier,2)}；仍需满足原策略信号才执行，预览不会触发买入。`;
+  byId('source').textContent=`本次仅选择理财持仓 ${s.holding_id} 中的 ${number(s.amount,8)} USDGO；按 ${number(s.mark_usdt,6)} USDT/USDGO 估值，记为追加本金。该持仓剩余策略外份额为 ${number(s.external_earn_after,8)} USDGO。`;
+  byId('excluded').replaceChildren();
+  for(const [coin,amount] of Object.entries(data.excluded.all_external_spot)) row('excluded',['现货',coin,number(amount,8)]);
+  for(const value of Object.values(data.excluded.remaining_external_earn)) row('excluded',['理财',value.coin,number(value.amount,8)]);
+  byId('interest').textContent=`假设按本次时点并入，新增份额从 ${date(data.interest.first_complete_period_start)} 至 ${date(data.interest.first_complete_period_end)} 的首个完整计息周期开始归入策略；实际并入时会重新确定时间。`;
+  byId('result').hidden=false;
+}
+async function refresh(){
+  byId('result').hidden=true;status('正在读取已对账快照…');
+  const params=new URLSearchParams({coin:byId('coin').value,amount:byId('amount').value});
+  if(query.get('holding_id')) params.set('holding_id',query.get('holding_id'));
+  const response=await fetch('/api/v1/trx/live/contribution-preview?'+params,{headers:{Authorization:'Bearer '+token},cache:'no-store'});
+  if(!response.ok){
+    const messages={401:'登录已过期，请重新登录。',409:'当前快照或可选金额暂不满足预览条件，请稍后刷新并核对数量。',422:'请检查币种和数量，数量须为正数且最多 8 位小数。',503:'账户快照暂不可用，请稍后刷新。'};
+    throw new Error(messages[response.status] || '暂时无法生成预览，请稍后刷新。');
+  }
+  render(await response.json());status('只读预览已更新，未正式并入。');
+}
+byId('login').addEventListener('submit',async event=>{
+  event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;
+  try{
+    status('正在登录旧网站…');
+    const bytes=new TextEncoder().encode(byId('username').value+':'+byId('password').value);
+    const auth=btoa(String.fromCharCode(...bytes));
+    const response=await fetch('/api/v1/token/login',{method:'POST',headers:{Authorization:'Basic '+auth},cache:'no-store'});
+    if(!response.ok) throw new Error('登录失败，请核对旧网站账号和密码。');
+    token=(await response.json()).access_token;
+    if(!token) throw new Error('登录结果异常。');
+    byId('password').value='';byId('login').hidden=true;byId('selection').hidden=false;
+    if(byId('amount').value) await refresh(); else status('请输入要核对的 USDGO 数量。');
+  }catch(error){status(error.message,true);}finally{button.disabled=false;}
+});
+byId('selection').addEventListener('submit',async event=>{
+  event.preventDefault();const button=event.target.querySelector('button');button.disabled=true;
+  try{await refresh();}catch(error){status(error.message,true);if(error.message.includes('登录已过期')){token='';byId('login').hidden=false;}}
+  finally{button.disabled=false;}
+});
+</script>
+</html>
