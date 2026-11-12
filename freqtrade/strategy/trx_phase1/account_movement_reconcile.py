@@ -7,7 +7,7 @@ from copy import deepcopy
 from decimal import localcontext
 from pathlib import Path
 
-from .account_movement_preview import preview, require
+from .account_movement_preview import EXTERNAL_CREDITS, preview, require
 from .income_allocation import VERSION, ownership
 from .ledger import Ledger, money
 from .live_execution import LiveExecution, digest
@@ -44,7 +44,7 @@ def _candidate(original, evidence, policy):  # noqa: C901 - one chronological ac
     manual = {
         bid
         for r in review["timeline"]
-        if r["type"] not in {"BATCH_INTEREST_USER_IN", "CASH_COUPON_ACTIVITY_USER_IN"}
+        if r["type"] not in {"BATCH_INTEREST_USER_IN", *EXTERNAL_CREDITS}
         for bid in r["bill_ids"]
     }
     require(manual == set(policy["manual_bill_ids"]), "movement_manual_scope_changed")
@@ -77,20 +77,22 @@ def _candidate(original, evidence, policy):  # noqa: C901 - one chronological ac
                 bid not in state["account_movement_bill_receipts"], "movement_bill_already_applied"
             )
             state["account_movement_bill_receipts"][bid] = digest(LiveExecution.interest_bill(raw))
-        if kind == "CASH_COUPON_ACTIVITY_USER_IN":
+        if kind in EXTERNAL_CREDITS:
             credit = LiveExecution.interest_bill(bills[0])
             receipt = "account-credit:" + credit["bill_id"]
             state["receipts"][receipt] = digest(credit)
-            offset("USDT", row["external_amount"])
+            delta = money(row["external_amount"]) + money(row.get("precision_residual", "0"))
+            offset("USDT", delta)
             state["quarantined_account_credits"][receipt] = {
                 **credit,
-                "offset_delta": row["external_amount"],
+                "offset_delta": str(delta),
                 "reported_amount": credit["amount"],
-                "precision_residual": "0",
+                "precision_residual": row.get("precision_residual", "0"),
                 "attribution": "external_account_credit",
                 "destination": "spot",
                 "recorded_at": now,
-                "reason": "outside_strategy_cash_coupon_reward",
+                "reason": EXTERNAL_CREDITS[kind],
+                **{k: v for k, v in row.items() if k in {"linked_order_id", "linked_fill_id"}},
             }
             event(
                 "external_credit_quarantined",
@@ -117,8 +119,15 @@ def _candidate(original, evidence, policy):  # noqa: C901 - one chronological ac
             offset(coin, outside)
             native_key = "income-bill:" + credit["bill_id"]
             state["receipts"][native_key] = digest(credit)
-            if coin == "USDT":
-                require(amount == 0, "movement_usdt_interest_must_remain_external")
+            if coin == "USDT" and amount:
+                from .stablecoin_policy import policy_for
+
+                stable_policy = policy_for(original)
+                require(
+                    stable_policy is not None and stamp >= stable_policy["starts_at"],
+                    "movement_usdt_interest_must_remain_external",
+                )
+            if coin == "USDT" and not amount:
                 receipt = "account-credit:" + credit["bill_id"]
                 state["receipts"][receipt] = digest(credit)
                 state["quarantined_account_credits"][receipt] = {
@@ -134,6 +143,9 @@ def _candidate(original, evidence, policy):  # noqa: C901 - one chronological ac
             else:
                 receipt = "income-allocation:" + credit["bill_id"]
                 fx = mark if coin == "USDGO" and amount else None
+                if coin == "USDC" and amount:
+                    fx = money(evidence["markets"]["USDCUSDT"]["bid"])
+                    require(fx > 0, "movement_usdc_valuation_required")
                 allocation = {
                     "coin": coin,
                     "bill_id": credit["bill_id"],
@@ -152,7 +164,8 @@ def _candidate(original, evidence, policy):  # noqa: C901 - one chronological ac
                     "attribution": "strategy_allocation",
                     "offset_delta": str(-amount),
                     "resolves_pending": native_key,
-                    "usdgo_mark": str(fx) if fx is not None else None,
+                    "usdgo_mark": str(fx) if coin == "USDGO" and fx is not None else None,
+                    **({"usdc_mark": str(fx)} if coin == "USDC" and fx is not None else {}),
                     "valuation_at": now,
                 }
                 if amount:
@@ -207,12 +220,18 @@ def _candidate(original, evidence, policy):  # noqa: C901 - one chronological ac
                     coin != "USDT" or policy.get("preserve_owned_usdt_location") is True,
                     "movement_owned_usdt_location_review_required",
                 )
-                available = book.usdgo if coin == "USDGO" else book.cash
+                available = {"USDGO": book.usdgo, "USDT": book.cash, "USDC": book.usdc}.get(
+                    coin, money(0)
+                )
+                locked = book.usdc_locked if coin == "USDC" else book.locked.get(coin, money(0))
                 require(
-                    coin in {"USDGO", "USDT"} and own <= available - book.locked[coin],
+                    coin in {"USDGO", "USDT", "USDC"} and own <= available - locked,
                     "movement_owned_subscription_invalid",
                 )
-                book.locked[coin] += own
+                if coin == "USDC":
+                    book.usdc_locked += own
+                else:
+                    book.locked[coin] += own
                 position["principal"] = str(money(position["principal"]) + own)
             position["unassigned_amount"] = str(money(position["unassigned_amount"]) + outside)
             if row["business_order_id"] not in position["subscription_ids"]:
@@ -257,6 +276,21 @@ def _candidate(original, evidence, policy):  # noqa: C901 - one chronological ac
             entry["strategy_principal"] = state["holdings"][hid]["principal"]
     outside_policy["sha256"] = digest(outside_policy)
     state["outside_usdt_income_policy"] = outside_policy
+    if "USDC" in state["unassigned_offsets"]:
+        state["external_usdc"] = {
+            **state.get("external_usdc", {}),
+            "spot": state["unassigned_offsets"]["USDC"],
+            "savings": str(
+                sum(
+                    (
+                        money(p["unassigned_amount"])
+                        for p in state["holdings"].values()
+                        if p["coin"] == "USDC"
+                    ),
+                    money(0),
+                )
+            ),
+        }
     for check in review["wallet_checks"]:
         require(
             money(state["unassigned_offsets"][check["coin"]]) == money(check["outside_strategy"]),

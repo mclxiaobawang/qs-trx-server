@@ -19,6 +19,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
+BACKUP_TIMEOUT_SECONDS = 240
+DATABASE_CHECK_TIMEOUT_SECONDS = 60
+
+
 def checksum(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -66,19 +70,38 @@ def copy_database(source, destination, deadline):
     Path(destination).chmod(0o600)
 
 
-def verify(directory, account):
+def verify(directory, account, *, deadline=None, checks=None):
     """Validate copied files in isolation; no restore is ever applied to the live account."""
     directory = Path(directory)
     for name in ("execution", "strategy"):
-        with closing(
-            sqlite3.connect(
-                (directory / (name + ".sqlite")).resolve().as_uri() + "?mode=ro", uri=True
-            )
-        ) as db:
-            until = time.monotonic() + 20
-            db.set_progress_handler(lambda deadline=until: int(time.monotonic() > deadline), 10000)
-            if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                raise ValueError("backup_database_check_failed")
+        started, cpu_started = time.monotonic(), time.process_time()
+        until = started + DATABASE_CHECK_TIMEOUT_SECONDS
+        if deadline is not None:
+            until = min(until, deadline)
+        try:
+            if started >= until:
+                raise TimeoutError("backup_time_budget_exceeded")
+            with closing(
+                sqlite3.connect(
+                    (directory / (name + ".sqlite")).resolve().as_uri() + "?mode=ro", uri=True
+                )
+            ) as db:
+                db.set_progress_handler(lambda limit=until: int(time.monotonic() > limit), 10000)
+                if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    raise ValueError("backup_database_check_failed")
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT and time.monotonic() > until:
+                raise TimeoutError("backup_database_check_timeout:" + name) from exc
+            raise
+        finally:
+            if checks is not None:
+                checks.append(
+                    {
+                        "database": name,
+                        "wall_seconds": round(time.monotonic() - started, 3),
+                        "cpu_seconds": round(time.process_time() - cpu_started, 3),
+                    }
+                )
     ev, execution = state(directory / "execution.sqlite", "execution")
     sv, strategy = state(directory / "strategy.sqlite", "strategy")
     control = json.loads((directory / "control.json").read_text())
@@ -148,6 +171,9 @@ def run_backup(config):
             prior = json.loads(status_path.read_text())
         except (OSError, ValueError):
             prior = {}
+        started = time.monotonic()
+        stage = "source_snapshot"
+        database_checks = {"copied": [], "archived": []}
         try:
             required = sum(
                 (source / (n + ".sqlite")).stat().st_size for n in ("execution", "strategy")
@@ -155,18 +181,21 @@ def run_backup(config):
             if shutil.disk_usage(root).free < max(1024**3, required * 3):
                 raise ValueError("backup_insufficient_free_space")
             start = int(time.time() * 1000)
-            deadline = time.monotonic() + 90
+            deadline = started + BACKUP_TIMEOUT_SECONDS
             with tempfile.TemporaryDirectory(prefix=".trx-auto-", dir=root) as temporary:
                 folder = Path(temporary)
                 for _attempt in range(3):
                     control = Path(config["control"]).read_bytes()
+                    # Copy the large candle history first. Its copied state version
+                    # must still be current while the smaller execution copy is made.
+                    copy_database(source / "strategy.sqlite", folder / "strategy.sqlite", deadline)
                     before = {
-                        n: state(source / (n + ".sqlite"), n)[0] for n in ("execution", "strategy")
+                        "strategy": state(folder / "strategy.sqlite", "strategy")[0],
+                        "execution": state(source / "execution.sqlite", "execution")[0],
                     }
-                    for name in ("execution", "strategy"):
-                        copy_database(
-                            source / (name + ".sqlite"), folder / (name + ".sqlite"), deadline
-                        )
+                    copy_database(
+                        source / "execution.sqlite", folder / "execution.sqlite", deadline
+                    )
                     after = {
                         n: state(source / (n + ".sqlite"), n)[0] for n in ("execution", "strategy")
                     }
@@ -178,14 +207,22 @@ def run_backup(config):
                 frozen = json.loads(control)
                 (folder / "control.json").write_text(json.dumps(frozen))
                 (folder / "control.json").chmod(0o600)
-                validation = verify(folder, config["account_id"])
+                stage = "copied_database_verification"
+                validation = verify(
+                    folder,
+                    config["account_id"],
+                    deadline=deadline,
+                    checks=database_checks["copied"],
+                )
                 if (
                     validation["execution_version"] != before["execution"]
                     or validation["strategy_version"] != before["strategy"]
                 ):
                     raise ValueError("backup_version_mismatch")
                 if config.get("history") and Path(config["history"]).is_file():
+                    stage = "history_copy"
                     copy_database(config["history"], folder / "history.sqlite", deadline)
+                stage = "archive_creation"
                 files = {p.name: checksum(p) for p in folder.iterdir() if p.is_file()}
                 manifest = {
                     "format": "trx-online-backup-v1",
@@ -208,11 +245,22 @@ def run_backup(config):
                 pending.chmod(0o600)
                 # Read back the archive in a fresh directory, including file hashes.
                 with tempfile.TemporaryDirectory(prefix=".trx-check-", dir=root) as check:
+                    stage = "archive_unpack_and_hash"
                     unpack_archive(pending, check)
-                    verify(check, config["account_id"])
+                    stage = "archived_database_verification"
+                    verify(
+                        check,
+                        config["account_id"],
+                        deadline=deadline,
+                        checks=database_checks["archived"],
+                    )
+                stage = "archive_checksum"
                 manifest["archive_sha256"] = checksum(pending)
+                if time.monotonic() > deadline:
+                    raise TimeoutError("backup_time_budget_exceeded")
                 pending.replace(archive)
                 atomic_json(root / (name + ".json"), manifest)
+            stage = "retention"
             retention = prune(root, int(config.get("maximum_bytes", 2 * 1024**3)))
             result = {
                 "last_success_at": int(time.time() * 1000),
@@ -225,6 +273,12 @@ def run_backup(config):
                 "offsite_configured": False,
                 "schedule": "hourly",
                 "credential_files_included": False,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "database_checks": database_checks,
+                "time_limits_seconds": {
+                    "backup": BACKUP_TIMEOUT_SECONDS,
+                    "database_check": DATABASE_CHECK_TIMEOUT_SECONDS,
+                },
             }
             atomic_json(status_path, result, config.get("status_owner"))
             return result
@@ -235,6 +289,10 @@ def run_backup(config):
                     **prior,
                     "last_attempt_at": int(time.time() * 1000),
                     "last_error": type(exc).__name__,
+                    "last_error_stage": stage,
+                    "last_error_message": str(exc)[:500],
+                    "last_attempt_duration_seconds": round(time.monotonic() - started, 3),
+                    "last_attempt_database_checks": database_checks,
                 },
                 config.get("status_owner"),
             )

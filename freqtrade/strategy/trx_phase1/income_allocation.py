@@ -173,7 +173,7 @@ def allocate(execution, book, positions, receipts, records, remote, now):  # noq
     for credit in [*pending.values(), *accounting["allocations"].values()]:
         bucket = (credit["coin"], credit["timestamp"] // HOUR)
         buckets[bucket] = buckets.get(bucket, 0) + 1
-    fx_quote = None
+    fx_quotes = {}
     for pending_key, credit in sorted(pending.items(), key=lambda item: item[1]["timestamp"]):
         if (
             credit.get("type") != "BATCH_INTEREST_USER_IN"
@@ -220,9 +220,11 @@ def allocate(execution, book, positions, receipts, records, remote, now):  # noq
         if key in receipts or key in book.events:
             accounting["status"] = "allocation_conflict"
             continue
-        if coin == "USDGO" and strategy and fx_quote is None:
-            fx_quote = execution.broker.market("USDGOUSDT", now)
-        fx = money(fx_quote["bid"]) if coin == "USDGO" and strategy else None
+        fx = None
+        if coin in {"USDGO", "USDC"} and strategy:
+            if coin not in fx_quotes:
+                fx_quotes[coin] = money(execution.broker.market(coin + "USDT", now)["bid"])
+            fx = fx_quotes[coin]
         allocation = {
             "coin": coin,
             "bill_id": credit["bill_id"],
@@ -246,7 +248,8 @@ def allocate(execution, book, positions, receipts, records, remote, now):  # noq
             "attribution": "strategy_allocation",
             "offset_delta": str(-strategy),
             "resolves_pending": pending_key,
-            "usdgo_mark": str(fx) if fx is not None else None,
+            "usdgo_mark": str(fx) if coin == "USDGO" and fx is not None else None,
+            **({"usdc_mark": str(fx)} if coin == "USDC" and fx is not None else {}),
             "valuation_at": now,
         }
         if strategy:

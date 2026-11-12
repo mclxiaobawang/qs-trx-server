@@ -112,7 +112,7 @@ def available_sources(state, policy, now):  # noqa: C901 - one atomic receipt/co
     for order_id, record in state.get("verified_savings_location_movements", {}).items():
         if (
             record.get("classification") != "verified_savings_location_only"
-            or record.get("coin") != "USDGO"
+            or record.get("coin") not in {"USDGO", "USDC"}
             or state["receipts"].get("observed-savings-subscription:" + order_id) != digest(record)
             or sum(
                 (money(v) for v in record.get("external_interest_sources", {}).values()), money(0)
@@ -120,10 +120,19 @@ def available_sources(state, policy, now):  # noqa: C901 - one atomic receipt/co
             > money(record["external_amount"])
         ):
             raise ReinvestmentDeferred("external_income_location_receipt_conflict")
+        if record["coin"] == "USDC":
+            if record.get("external_interest_sources"):
+                raise ReinvestmentDeferred("external_income_location_receipt_conflict")
+            continue  # A verified USDC location never consumes USDGO interest.
         for source, amount in record.get("external_interest_sources", {}).items():
             if money(amount) <= 0:
                 raise ReinvestmentDeferred("external_income_location_receipt_conflict")
             spent[source] = spent.get(source, money(0)) + money(amount)
+    from .verified_external_movements import consumed_interest
+
+    external_used, _ = consumed_interest(state)
+    for source, amount in external_used.items():
+        spent[source] = spent.get(source, money(0)) + amount
     allocations = accounting.get("allocations", {})
     for key, expected in policy["baseline_sources"].items():
         if key not in allocations or digest(allocations[key]) != expected:

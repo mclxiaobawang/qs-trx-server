@@ -26,7 +26,7 @@ def state(**fields):
     }
 
 
-def test_grace_is_bounded_and_only_covers_existing_evidence_codes():
+def test_grace_is_bounded_and_only_covers_recognized_evidence_codes():
     assert wait.WAIT_CODES == EVIDENCE_WAIT_CODES
     assert wait.pending_wait(state(), NOW + 299999)
     for value in [
@@ -41,6 +41,24 @@ def test_grace_is_bounded_and_only_covers_existing_evidence_codes():
     assert wait.pending_wait(state(), NOW + 300000) is None
     assert wait.pending_wait(state(), NOW + 1, {"error": "ambiguous_write"}) is None
     assert wait.pending_wait(state(phase="executing"), NOW + 1)
+    external = state(error=wait.EXTERNAL_MOVEMENT_EVIDENCE_PENDING)
+    assert wait.pending_wait(external, NOW + 299999)
+    assert wait.pending_wait(external, NOW + 300000) is None
+
+
+def test_missing_external_withdrawal_receipt_uses_bounded_wait(mocker, monkeypatch):
+    from freqtrade.strategy.trx_phase1 import verified_external_movements
+
+    runtime = mocker.Mock()
+    runtime.income_candidate.side_effect = ExecutionError("unrecognized_usdt_movement")
+    monkeypatch.setattr(
+        verified_external_movements,
+        "observe",
+        mocker.Mock(side_effect=ExecutionError(wait.EXTERNAL_MOVEMENT_EVIDENCE_PENDING)),
+    )
+    with pytest.raises(ExecutionError, match=wait.EXTERNAL_MOVEMENT_EVIDENCE_PENDING):
+        wait.verified_income_candidate(runtime, None, {}, {}, NOW)
+    runtime.check_wallet.assert_not_called()
 
 
 def test_only_a_later_exact_verification_clears_an_active_flow_error():

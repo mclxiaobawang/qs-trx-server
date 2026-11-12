@@ -41,6 +41,8 @@ class Ledger:
         self.usdgo = money(0)
         self.usdgo_cost = money(0)
         self.usdgo_mark = None
+        self.usdc = self.usdc_cost = self.usdc_locked = money(0)
+        self.usdc_mark = None
         self.interest_trx = money(0)
         self.interest_sale_proceeds = money(0)
         self.locked = {coin: money(0) for coin in ("USDT", "USDGO", "TRX_INTEREST")}
@@ -85,7 +87,14 @@ class Ledger:
         if self.usdgo and fx is None and self.usdgo_mark is None:
             raise ValueError("USDGO valuation requires an observed exchange price")
         rate = money(fx) if fx is not None else self.usdgo_mark or money(0)
-        return self.cash + self.usdgo * rate + (self.principal + self.interest_trx) * money(price)
+        if self.usdc and self.usdc_mark is None:
+            raise ValueError("USDC valuation requires an observed exchange price")
+        return (
+            self.cash
+            + self.usdgo * rate
+            + self.usdc * (self.usdc_mark or money(0))
+            + (self.principal + self.interest_trx) * money(price)
+        )
 
     def qualifying(self, price, quantity, fee_rate, margin=0):
         price, quantity, fee, margin = map(money, (price, quantity, fee_rate, margin))
@@ -250,6 +259,13 @@ class Ledger:
             self.usdgo_cost += value
             self.usdgo_mark = money(fx)
             self.stable_interest += value
+        elif coin == "USDC":
+            if fx is None or money(fx) <= 0:
+                raise ValueError("USDC interest requires an observed exchange price")
+            self.usdc_mark = money(fx)
+            self.usdc += amount
+            self.usdc_cost += amount * self.usdc_mark
+            self.stable_interest += amount * self.usdc_mark
         else:
             raise ValueError("Unsupported interest currency; reconcile its USDT value first")
         self.events.add(event_id)
@@ -310,9 +326,56 @@ class Ledger:
             self.usdgo_cost -= cost
             self.cash += received
             self.fx_profit += received - cost
+        elif side == "to_usdc":
+            if paid > self.free_cash:
+                raise ValueError("Exchange exceeds available USDT")
+            self.cash -= paid
+            self.usdc += received
+            self.usdc_cost += paid
+            self.usdc_mark = mark
+        elif side == "from_usdc":
+            if paid > self.usdc - self.usdc_locked:
+                raise ValueError("Exchange exceeds available USDC")
+            cost = self.usdc_cost if paid == self.usdc else self.usdc_cost * paid / self.usdc
+            self.usdc -= paid
+            self.usdc_cost -= cost
+            self.cash += received
+            self.fx_profit += received - cost
+            self.usdc_mark = mark
         else:
             raise ValueError("Unknown conversion direction")
-        self.usdgo_mark = mark
+        if side in ("to_usdgo", "to_usdt"):
+            self.usdgo_mark = mark
+        self.events.add(event_id)
+
+    def convert_stable_pair(self, event_id, source, paid, received, usdc_mark):
+        if event_id in self.events:
+            return
+        paid, received, usdc_mark = map(money, (paid, received, usdc_mark))
+        if min(paid, received, usdc_mark) <= 0:
+            raise ValueError("Invalid confirmed stablecoin exchange")
+        if source == "USDGO":
+            if paid > self.usdgo - self.locked["USDGO"]:
+                raise ValueError("Exchange exceeds available USDGO")
+            cost = self.usdgo_cost if paid == self.usdgo else self.usdgo_cost * paid / self.usdgo
+            self.usdgo -= paid
+            self.usdgo_cost -= cost
+            self.usdc += received
+            value = received * usdc_mark
+            self.usdc_cost += value
+        elif source == "USDC":
+            if paid > self.usdc - self.usdc_locked:
+                raise ValueError("Exchange exceeds available USDC")
+            cost = self.usdc_cost if paid == self.usdc else self.usdc_cost * paid / self.usdc
+            self.usdc -= paid
+            self.usdc_cost -= cost
+            self.usdgo += received
+            value = paid * usdc_mark
+            self.usdgo_cost += value
+        else:
+            raise ValueError("Unknown stablecoin exchange source")
+        self.usdc_mark = usdc_mark
+        self.fx_profit += value - cost
         self.events.add(event_id)
 
     def external_flow(self, event_id, amount, price):
@@ -523,6 +586,11 @@ class Ledger:
             "usdgo_unrealized_profit": float(
                 self.usdgo * money(fx if fx is not None else self.usdgo_mark or 0) - self.usdgo_cost
             ),
+            **(
+                {"usdc": float(self.usdc), "usdc_market_value": float(self.usdc * self.usdc_mark)}
+                if self.usdc_mark is not None
+                else {}
+            ),
             "principal_trx": float(self.principal),
             "interest_trx": float(self.interest_trx),
             "interest_sale_proceeds": float(self.interest_sale_proceeds),
@@ -565,6 +633,16 @@ class Ledger:
         }
         return {
             **values,
+            **(
+                {
+                    "usdc": str(self.usdc),
+                    "usdc_cost": str(self.usdc_cost),
+                    "usdc_locked": str(self.usdc_locked),
+                    "usdc_mark": str(self.usdc_mark) if self.usdc_mark is not None else None,
+                }
+                if self.usdc or self.usdc_mark is not None
+                else {}
+            ),
             "usdgo_mark": str(self.usdgo_mark) if self.usdgo_mark is not None else None,
             "locked": {k: str(v) for k, v in self.locked.items()},
             "lots": [lot.state() for lot in self.lots],
@@ -577,6 +655,10 @@ class Ledger:
     @classmethod
     def restore(cls, state):
         book = cls(state["initial"])
+        for key in ("usdc", "usdc_cost", "usdc_locked"):
+            setattr(book, key, money(state.get(key, 0)))
+        if state.get("usdc_mark") is not None:
+            book.usdc_mark = money(state["usdc_mark"])
         book.withdrawn_usdgo_profit = money(state.get("withdrawn_usdgo_profit", "0"))
         for key in (
             "cash",

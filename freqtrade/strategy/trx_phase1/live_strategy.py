@@ -6,16 +6,20 @@ start writes. Public market catch-up advances the clock without backfilling trad
 
 import fcntl
 import json
+import logging
 import math
+import re
 import sqlite3
 import threading
 import time
+import traceback
 from contextlib import closing
 from copy import deepcopy
 
 import ccxt
 import pandas as pd
 
+from freqtrade.strategy.trx_phase1 import stablecoin_policy
 from freqtrade.strategy.trx_phase1.candles import normalized_volatility, validate_minutes
 from freqtrade.strategy.trx_phase1.config import ResearchConfig
 from freqtrade.strategy.trx_phase1.engine import Engine
@@ -25,24 +29,66 @@ from freqtrade.strategy.trx_phase1.live_execution import digest
 from freqtrade.strategy.trx_phase1.live_funding import LiveFunding
 from freqtrade.strategy.trx_phase1.live_observation import observed_close
 from freqtrade.strategy.trx_phase1.price_position import DAY, OFFSET, build_price_reference
+from freqtrade.strategy.trx_phase1.reconciliation_wait import WAIT_CODES as EVIDENCE_WAIT_CODES
 from freqtrade.strategy.trx_phase1.reconciliation_wait import clear_verified_wait, pending_wait
-from freqtrade.strategy.trx_phase1.shadow_market import validate_quote
+from freqtrade.strategy.trx_phase1.shadow_market import PublicMarketDataError, validate_quote
 
 
 TERMINAL = {"completed", "expired", "failed", "needs_review"}
-EVIDENCE_WAIT_CODES = {
-    "account_credit_wallet_evidence_required",
-    "wallet_reconciliation_required",
-    "owned_balance_not_spendable",
-    "interest_holding_evidence_incomplete",
-    "interest_arrival_bill_unverified",
-}
 PUBLIC_RETRY_CODES = {
     "stale_execution_quote",
     "market_clock_mismatch",
     "public_market_response_failed",
     "public_history_incomplete",
 }
+REBALANCE_PREFLIGHT_DEFER = {
+    "external_stablecoin_holding_mismatch",
+    "external_stablecoin_income_unresolved",
+    "external_stablecoin_policy_not_enabled",
+    "owned_holding_unavailable",
+    "redemption_terms_unverified",
+    "strategy_funds_unavailable",
+    "subscription_terms_not_satisfied",
+}
+
+
+def error_diagnostic(exc, stage, market, broker):
+    """Record a bounded traceback without locals, credentials or URL parameters."""
+    secrets = []
+    settings = getattr(getattr(broker, "transport", None), "settings", None)
+    for name in ("api_key", "secret_key", "passphrase"):
+        value = getattr(settings, name, None)
+        if value is not None:
+            secrets.append(value.get_secret_value())
+
+    def redact(value, limit):
+        text = str(value)
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "<redacted>")
+        text = re.sub(r"(?i)(Bearer |Basic )\S+", r"\1<redacted>", text)
+        text = re.sub(
+            r"(?i)((?:access[-_]?key|access[-_]?sign|api[-_]?key|secret|passphrase|password|authorization)"
+            r"[\"']?\s*[:=]\s*[\"']?)[^\s,;\"'}]+",
+            r"\1<redacted>",
+            text,
+        )
+        text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?<redacted>", text)
+        return text[:limit]
+
+    diagnostic = {
+        "exception_type": type(exc).__name__,
+        "message": redact(exc, 1500),
+        "stage": stage,
+        "traceback": redact("".join(traceback.format_exception(exc, limit=12)), 6000),
+    }
+    if stage in {"public_snapshot", "public_minute_update"}:
+        diagnostic["request_stage"] = getattr(exc, "stage", getattr(market, "request_stage", None))
+        context = getattr(exc, "context", getattr(market, "diagnostic_context", {}))
+        diagnostic["public_response"] = redact(
+            json.dumps(context, ensure_ascii=False, default=str), 2800
+        )
+    return diagnostic
 
 
 class LiveStrategyStore(StateStore):
@@ -233,7 +279,7 @@ class LiveStrategy:
 
     def capture_observation(self, now):
         markets = self.state["markets"]
-        if set(markets) != {"TRXUSDT", "USDGOUSDT"}:
+        if not {"TRXUSDT", "USDGOUSDT"} <= set(markets):
             return
         times = [int(value["timestamp"]) for value in markets.values()]
         if any(not -30000 <= now - stamp <= 60000 for stamp in times):
@@ -242,6 +288,8 @@ class LiveStrategy:
         book = Ledger.restore(execution["book"])
         price = money(markets["TRXUSDT"]["bid"])
         book.usdgo_mark = money(markets["USDGOUSDT"]["bid"])
+        if "USDCUSDT" in markets:
+            book.usdc_mark = money(markets["USDCUSDT"]["bid"])
         summary = book.summary(price)
         nav = float(book.equity(price) / book.fund_units) if book.fund_units else 0
         if not math.isfinite(nav) or nav <= 0:
@@ -323,18 +371,30 @@ class LiveStrategy:
         )
 
     def environment(self, now):
-        markets = {
-            symbol: self.execution.broker.market(symbol, now) for symbol in ("TRXUSDT", "USDGOUSDT")
-        }
+        stablecoins = self.execution.stablecoin_policy
+        monitor_rates = stablecoins and self.state["desired"] == "running"
+        symbols = (
+            ("TRXUSDT", "USDGOUSDT", "USDCUSDT", "USDGOUSDC")
+            if stablecoins
+            else ("TRXUSDT", "USDGOUSDT")
+        )
+        markets = {symbol: self.execution.broker.market(symbol, now) for symbol in symbols}
+        if monitor_rates:
+            stablecoin_policy.poll(self.execution, self.state, now)
         terms = {}
         for rule in self.execution.state["products"]:
             if rule["redemption_minimum"] is None:
                 raise ExecutionError("redemption_terms_unverified")
+            if monitor_rates and rule["coin"] == "USDGO":
+                cached = self.state.get("stablecoin_rates", {}).get("terms", {}).get("USDGO")
+                if cached is not None:
+                    terms["USDGO"] = cached
+                continue
             value = self.execution.broker.product(rule["coin"], rule["product_id"])
             if value["status"] != "in_progress":
                 raise ExecutionError("product_unavailable")
             terms[rule["coin"]] = value
-        if set(terms) != {"TRX", "USDGO"}:
+        if "TRX" not in terms or (not stablecoins and "USDGO" not in terms):
             raise ExecutionError("both_live_products_required")
         self.state.update(markets=markets, terms=terms)
         self.engine.config = self.engine.config.model_copy(
@@ -416,7 +476,15 @@ class LiveStrategy:
 
     def finish_intent(self, flow, now):
         intent = self.state["intent"]
-        if flow["status"] in {"failed", "needs_review"}:
+        rejected = flow.get("rebalance_redemption_failure")
+        if flow.get("rebalance_quote_deferred"):
+            self.state["stablecoin_rebalance_deferred_rate_at"] = self.state.get(
+                "stablecoin_rates", {}
+            ).get("checked_at")
+        if intent["kind"] == "stablecoin_rebalance" and flow["status"] == "failed" and rejected:
+            self.state["stablecoin_rebalance_halted"] = {**rejected, "flow_id": flow["id"]}
+            self.event("stablecoin_rebalance_halted", now, failure=rejected)
+        elif flow["status"] in {"failed", "needs_review"}:
             code = (self.execution.state.get("operation") or {}).get("cancel_review_code")
             self.state.update(
                 phase="blocked", error=code or "execution_requires_review", desired="paused"
@@ -440,7 +508,7 @@ class LiveStrategy:
         if self.execution.state["anchor"]:
             self.engine.anchor = float(self.execution.state["anchor"])
             self.engine.anchor_version = self.execution.state["anchor_version"]
-        if intent["kind"] not in {"earn", "withdrawal"}:
+        if intent["kind"] not in {"earn", "withdrawal", "stablecoin_rebalance"}:
             self.engine.pending = None
             self.state["reschedule_after_trade"] = True
         self.state["last_flow"] = {
@@ -452,7 +520,7 @@ class LiveStrategy:
         self.state["intent"] = None
         self.event("strategy_flow_finished", now, status=flow["status"])
 
-    def resolve_execution(self, now):
+    def resolve_execution(self, now, *, prepare_rebalance=False):
         self.dispatch(now)
         if (
             self.state["intent"]
@@ -468,6 +536,12 @@ class LiveStrategy:
                 raise ExecutionError("strategy_execution_binding_mismatch")
             if self.state["desired"] != "running":
                 self.execution.request_stop(now)
+            elif self.state["intent"]["kind"] == "stablecoin_rebalance" and not prepare_rebalance:
+                operation = state.get("operation")
+                if flow["status"] not in TERMINAL and (
+                    operation is None or operation["status"] == "prepared"
+                ):
+                    return True  # Give the fresh market observation priority over a new submission.
             self.execution.tick(now)
             self.execution.reload()
             state, flow = self.execution.state, self.execution.state["flow"]
@@ -476,15 +550,7 @@ class LiveStrategy:
             elif (
                 state["events"] and state["events"][-1]["kind"] == "read_or_reconciliation_blocked"
             ):
-                code = state["events"][-1]["code"]
-                if code in {
-                    "signal_price_condition_changed",
-                    "price_deviation_exceeded",
-                    "order_below_minimum",
-                }:
-                    self.execution.request_stop(now)
-                elif code != "redemption_cooldown":
-                    raise ExecutionError(code)
+                self.handle_execution_block(state, now)
             self.state["phase"] = (
                 "executing" if self.state["desired"] == "running" else self.state["phase"]
             )
@@ -494,11 +560,41 @@ class LiveStrategy:
             raise ExecutionError("unowned_execution_flow")
         return False
 
+    def handle_execution_block(self, state, now):
+        code = state["events"][-1]["code"]
+        operation = state.get("operation")
+        rebalance_preflight = self.state["intent"]["kind"] == "stablecoin_rebalance" and (
+            operation is None or operation["status"] == "prepared"
+        )
+        if rebalance_preflight and code in {
+            "subscription_terms_not_satisfied",
+            "stablecoin_subscription_tier_changed",
+        }:
+            flow = state["flow"]
+            step = flow["steps"][flow["index"]]
+            if step["kind"] == "subscribe":
+                stablecoin_policy.invalidate_subscription(
+                    self.state, step["coin"], step["product_id"], now, code
+                )
+        if code in {
+            "signal_price_condition_changed",
+            "price_deviation_exceeded",
+            "order_below_minimum",
+            "stablecoin_subscription_tier_changed",
+        } or (rebalance_preflight and code in REBALANCE_PREFLIGHT_DEFER):
+            self.execution.request_stop(now)
+        elif code != "redemption_cooldown":
+            raise ExecutionError(code)
+
     def market_minutes(self, now, funding):  # noqa: C901 - forward-only observation and scheduling
         if self.data is None:
+            self.poll_stage = "minute_history_load"
             self.data = self.store.candles()
+        self.poll_stage = "public_minute_update"
         self.data = self.market.update(self.data, now)
+        self.poll_stage = "minute_candle_persist"
         self.store.add_candles(self.data)
+        self.poll_stage = "minute_signal_evaluation"
         stamps = pd.DatetimeIndex(self.data.date).as_unit("ms").asi8 + 60000
         last = int(stamps[-1])
         if last > now or now - last > 120000:
@@ -589,63 +685,96 @@ class LiveStrategy:
         return True
 
     def tick(self, now):
+        self.poll_stage = "credential_guard"
         if not self.credential_guard():
             raise ExecutionError("credentials_changed_requires_preflight")
         self.state["last_poll_at"] = now
         from freqtrade.strategy.trx_phase1 import live_withdrawal
 
+        self.poll_stage = "withdrawal_reconciliation"
         live_withdrawal.advance(self, now)
+        self.poll_stage = "execution_reconciliation"
         busy = self.resolve_execution(now)
         if self.state["desired"] != "running":
             if self.state["phase"] != "blocked":
                 self.state["phase"] = "paused"
             self.persist()
             return
+        self.poll_stage = "public_snapshot"
         observed, quote = self.market.snapshot()
         if abs(observed - now) > 30000:
             raise ExecutionError("market_clock_mismatch")
         now = observed
         validate_quote(quote, now)
+        self.poll_stage = "execution_status_read"
         if not self.execution.status()["operation"]:
+            self.poll_stage = "income_reconciliation"
             self.execution.import_interest(now)
+        self.poll_stage = "execution_state_reload"
         self.execution.reload()
         resolved = clear_verified_wait(self.state, self.execution.state, now)
         if resolved:
             self.event("account_evidence_wait_resolved", now, **resolved)
         self.sync_savings_observation()
+        self.poll_stage = "funding_environment"
         funding = self.environment(now)
+        self.poll_stage = "public_minute_update"
         if not self.market_minutes(now, funding):
             self.persist()
             return
+        if busy and (self.state.get("intent") or {}).get("kind") == "stablecoin_rebalance":
+            if (
+                self.engine.pending
+                or self.state.get("stablecoin_rates", {}).get("status") != "confirmed"
+            ):
+                self.execution.request_stop(now)
+            self.poll_stage = "rebalance_execution"
+            busy = self.resolve_execution(now, prepare_rebalance=True)
         if busy:
+            self.poll_stage = "observation_persist"
             self.state["phase"] = "executing"
             self.capture_observation(now)
             self.persist()
             return
+        self.poll_stage = "signal_decision"
         self.decide(funding, now)
         self.state["error"] = None
         self.state["evidence_wait_started_at"] = None
         self.state["evidence_wait_last_seen_at"] = None
+        self.poll_stage = "observation_persist"
         self.capture_observation(now)
         self.persist()
 
     def poll_error(self, exc, now):
+        diagnostic = error_diagnostic(
+            exc, getattr(self, "poll_stage", "unknown"), self.market, self.execution.broker
+        )
+        self.state["last_error_diagnostic"] = {"timestamp": now, **diagnostic}
+        logging.getLogger(__name__).warning(
+            "C1 poll failed %s", json.dumps(diagnostic, ensure_ascii=False)
+        )
         code = (
             str(exc)
-            if isinstance(exc, ExecutionError)
+            if isinstance(exc, (ExecutionError, PublicMarketDataError))
             or (isinstance(exc, ValueError) and str(exc) in PUBLIC_RETRY_CODES)
             else "market_network_unavailable"
             if isinstance(exc, ccxt.NetworkError)
             else "unverified_strategy_evidence"
         )
-        retryable = code.startswith("exchange_read_") or code in PUBLIC_RETRY_CODES | {
-            "exchange_response_unavailable",
-            "quote_stale",
-            "quote_expired_during_preflight",
-            "finalized_market_data_stale",
-            "market_network_unavailable",
-            "request_rate_wait",
-        }
+        retryable = (
+            isinstance(exc, PublicMarketDataError)
+            or code.startswith("exchange_read_")
+            or code
+            in PUBLIC_RETRY_CODES
+            | {
+                "exchange_response_unavailable",
+                "quote_stale",
+                "quote_expired_during_preflight",
+                "finalized_market_data_stale",
+                "market_network_unavailable",
+                "request_rate_wait",
+            }
+        )
         evidence_wait = code in EVIDENCE_WAIT_CODES
         if evidence_wait:
             self.state["evidence_wait_last_seen_at"] = now
@@ -667,6 +796,7 @@ class LiveStrategy:
             "strategy_poll_blocked",
             now,
             code=code,
+            diagnostic=diagnostic,
             **({"wallet_mismatch": details} if details else {}),
         )
         self.persist()
@@ -686,11 +816,23 @@ class LiveStrategy:
             if now >= self.engine.pending.expires_at:
                 self.engine.finish(now)
             else:
-                steps = funding.for_plan(self.engine.pending)
+                try:
+                    steps = funding.for_plan(self.engine.pending, now=now)
+                except ExecutionError as exc:
+                    if str(exc) not in {
+                        "stablecoin_buy_funding_unavailable",
+                        "stablecoin_buy_funding_window_too_short",
+                    }:
+                        raise
+                    self.event("stablecoin_buy_funding_deferred", now, code=str(exc))
+                    self.state["phase"] = "observing"
+                    return
                 self.make_intent(steps, "trade", now, self.engine.pending.expires_at)
                 self.state["phase"] = "executing"
         else:
             idle = funding.idle(now, self.state["last_cash_switch"])
+            if not idle and self.try_stablecoin_rebalance(funding, now):
+                return
             if not idle:
                 from freqtrade.strategy.trx_phase1.external_income_reinvestment import (
                     ReinvestmentDeferred,
@@ -699,7 +841,8 @@ class LiveStrategy:
 
                 try:
                     self.state.pop("external_income_reinvestment", None)
-                    idle = plan_steps(self.execution, funding.terms, now)
+                    if "USDGO" in funding.terms:
+                        idle = plan_steps(self.execution, funding.terms, now)
                 except ReinvestmentDeferred as exc:
                     self.state["external_income_reinvestment"] = {
                         "phase": "deferred",
@@ -711,6 +854,47 @@ class LiveStrategy:
                 self.state["phase"] = "executing"
             else:
                 self.state["phase"] = "observing"
+
+    def try_stablecoin_rebalance(self, funding, now):
+        if not funding.policy or self.state.get("stablecoin_rebalance_halted"):
+            return False
+        rates = self.state.get("stablecoin_rates", {})
+        execution = self.execution.state
+        if (
+            rates.get("status") != "confirmed"
+            or rates["checked_at"] == self.state.get("stablecoin_rebalance_deferred_rate_at")
+            or not 0 <= now - rates["checked_at"] < stablecoin_policy.POLL_MS
+            or execution.get("pending_income")
+            or execution.get("income_accounting", {}).get("status") != "active"
+        ):
+            return False
+        # Recalculate after an owned balance changes, or at the next rate poll.
+        # A quiet worker need not repeatedly fetch every historical holding page.
+        check = [
+            rates["checked_at"],
+            digest([execution["book"], execution["holdings"], execution["unassigned_offsets"]]),
+        ]
+        if self.state.get("stablecoin_last_review") == check:
+            return False
+        self.state["stablecoin_last_review"] = check
+        try:
+            holdings = self.execution.broker.holdings(execution["created_at"] - 1000, now)
+            steps = stablecoin_policy.rebalance(funding, rates["terms"], holdings)
+            if not steps:
+                from freqtrade.strategy.trx_phase1.external_stablecoin import enabled
+
+                if enabled(execution, funding.policy):
+                    steps = stablecoin_policy.rebalance(
+                        funding, rates["terms"], holdings, outside=True
+                    )
+        except (ExecutionError, ArithmeticError, ValueError, KeyError) as exc:
+            self.event("stablecoin_rebalance_deferred", now, code=type(exc).__name__)
+            return False
+        if not steps:
+            return False
+        self.make_intent(steps, "stablecoin_rebalance", now, now + 10 * 60000)
+        self.state["phase"] = "executing"
+        return True
 
     def start(self):
         with self.lock:

@@ -27,7 +27,8 @@ from freqtrade.strategy.trx_phase1.request_limits import (
 
 
 COINS = ("USDT", "USDGO", "TRX")
-SYMBOLS = {"TRXUSDT": "TRX", "USDGOUSDT": "USDGO"}
+SYMBOLS = {"TRXUSDT": "TRX", "USDGOUSDT": "USDGO", "USDCUSDT": "USDC", "USDGOUSDC": "USDGO"}
+STABLECOIN_SYMBOLS = {"USDGOUSDT", "USDCUSDT", "USDGOUSDC"}
 GET_PATHS = {
     "v2/earn/account/assets",
     "v2/public/time",
@@ -35,6 +36,7 @@ GET_PATHS = {
     "v2/spot/account/deduct-info",
     "v2/spot/account/assets",
     "v2/spot/account/bills",
+    "v2/spot/wallet/withdrawal-records",
     "v2/spot/public/symbols",
     "v2/spot/market/orderbook",
     "v2/common/trade-rate",
@@ -152,8 +154,9 @@ class ClassicTransport:
                 # once immediately before HTTP; never renew a consumed redeem
                 # slot and never retry an HTTP request with an unknown outcome.
                 try:
-                    self.limiter.acquire(path, self.credential, priority=1,
-                                         write=True, max_wait=min(0.5, remaining))
+                    self.limiter.acquire(
+                        path, self.credential, priority=1, write=True, max_wait=min(0.5, remaining)
+                    )
                 except RateLimitWait:
                     raise WriteNotSent("request_rate_wait") from None
                 if self.limiter.clock() >= permit[1]:
@@ -222,10 +225,22 @@ class ClassicTransport:
             code = str(payload.get("code", "")) if isinstance(payload, dict) else ""
             code = code if re.fullmatch(r"\d{1,10}", code) else "invalid"
             if method == "GET":
-                raise ExecutionError("exchange_read_" + code)
+                error = ExecutionError("exchange_read_" + code)
+                error.read_diagnostic = {
+                    "path": path,
+                    "http_status": response.status_code,
+                    "code": code,
+                    "message": str(payload.get("msg", ""))[:1500]
+                    if isinstance(payload, dict)
+                    else "invalid_response",
+                }
+                raise error
             # All other server errors, including duplicate-client-ID errors, may
             # follow acceptance. Resolve by query, never repeat the write.
-            error = WriteRejected if code in {"40014", "40085", "40006", "40009"} else WriteUnknown
+            rejected = code in {"40014", "40085", "40006", "40009"}
+            if path == "v2/earn/savings/redeem":
+                rejected |= code in {"59031", "59033", "59034", "59035", "59037", "59038", "59039"}
+            error = WriteRejected if rejected else WriteUnknown
             raise error("exchange_write_" + code)
         if not 200 <= response.status_code < 300 or "data" not in payload:
             error = WriteUnknown if method == "POST" else ExecutionError
@@ -270,10 +285,16 @@ class ClassicTransport:
 
 
 class ClassicBroker:
+    include_usdc = False
+
     def __init__(self, transport, clock=None):
         self.transport = transport
         self.clock = clock or (lambda: int(time.time() * 1000) + self.transport.offset)
         self.savings_observation = None
+
+    def submission_times(self):
+        """Local flow time and exchange quote time are separate clocks."""
+        return int(time.time() * 1000), self.clock()
 
     @property
     def writes_enabled(self):
@@ -299,7 +320,7 @@ class ClassicBroker:
         # assetType=all response explicitly reports every requested balance and
         # its restriction, without guessing that an unknown restriction is zero.
         rows = self.get("v2/spot/account/assets", {"assetType": "all"})
-        for coin in COINS:
+        for coin in (*COINS, "USDC") if self.include_usdc else COINS:
             matches = [r for r in rows if r.get("coin") == coin]
             if len(matches) != 1:
                 raise ExecutionError("balance_missing_or_duplicated")
@@ -356,6 +377,9 @@ class ClassicBroker:
         if len(matches) != 1:
             raise ExecutionError("market_unavailable")
         row = matches[0]
+        # Keep slow metadata and fee reads ahead of the executable stablecoin quote.
+        rate_args = {"symbol": symbol, "businessType": "spot"}
+        rate = self.get("v2/common/trade-rate", rate_args) if symbol in STABLECOIN_SYMBOLS else None
         book = self.get(
             "v2/spot/market/orderbook", {"symbol": symbol, "type": "step0", "limit": "20"}
         )
@@ -365,7 +389,8 @@ class ClassicBroker:
         bid, ask = positive(book["bids"][0][0]), positive(book["asks"][0][0])
         if bid > ask:
             raise ExecutionError("crossed_orderbook")
-        rate = self.get("v2/common/trade-rate", {"symbol": symbol, "businessType": "spot"})
+        if rate is None:
+            rate = self.get("v2/common/trade-rate", rate_args)
         fee = money(rate["takerFeeRate"])
         if not 0 <= fee < money("0.1"):
             raise ExecutionError("fee_rate_unverified")
@@ -395,7 +420,11 @@ class ClassicBroker:
     def product(self, coin, product_id):
         # A new strategy may hold neither product yet. Include selected available
         # and held/retired products, then verify exact identity and status below.
-        rows = self.get("v2/earn/savings/product", {"coin": coin, "filter": "all"})
+        try:
+            rows = self.get("v2/earn/savings/product", {"coin": coin, "filter": "all"})
+        except ExecutionError as exc:
+            exc.product_request_stage = "product_catalog"
+            raise
         matches = [
             r
             for r in rows
@@ -405,9 +434,14 @@ class ClassicBroker:
         ]
         if len(matches) != 1:
             raise ExecutionError("product_unverified")
-        terms = self.get(
-            "v2/earn/savings/subscribe-info", {"productId": product_id, "periodType": "flexible"}
-        )
+        try:
+            terms = self.get(
+                "v2/earn/savings/subscribe-info",
+                {"productId": product_id, "periodType": "flexible"},
+            )
+        except ExecutionError as exc:
+            exc.product_request_stage = "subscription_info"
+            raise
         return {"status": matches[0]["status"], "tiers": matches[0].get("apyList", []), **terms}
 
     def holdings(self, start, end):
@@ -424,7 +458,8 @@ class ClassicBroker:
                 cursor_key="orderId",
             )
             for row in rows:
-                if row.get("periodType") == "flexible" and row.get("productCoin") in COINS:
+                coins = (*COINS, "USDC") if self.include_usdc else COINS
+                if row.get("periodType") == "flexible" and row.get("productCoin") in coins:
                     key = identifier(row["orderId"])
                     normalized = {
                         "order_id": key,
@@ -563,6 +598,13 @@ class ClassicBroker:
     def reserve_submission(self, operation, expires_at):
         kind = operation["kind"]
         path = "v2/spot/trade/place-order" if kind == "trade" else "v2/earn/savings/" + kind
+        if kind == "trade" and operation["request"]["symbol"] in STABLECOIN_SYMBOLS:
+            flow_now, exchange_now = self.submission_times()
+            quote_age = exchange_now - operation["market"]["timestamp"]
+            if not -2000 <= quote_age < 10000:
+                raise ExecutionError("quote_expired_during_preflight")
+            self.transport.reserve_write(path, min(expires_at - flow_now, 10000 - quote_age) / 1000)
+            return
         remaining = expires_at - self.clock()
         if kind == "trade":
             remaining = min(remaining, operation["market"]["timestamp"] + 10000 - self.clock())

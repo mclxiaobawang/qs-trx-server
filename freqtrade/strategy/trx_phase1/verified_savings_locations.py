@@ -1,4 +1,4 @@
-"""Recognize proven USDGO spot-to-selected-Savings movements; never submit one.
+"""Recognize proven USDGO/USDC spot-to-selected-Savings movements; never submit one.
 
 Mixed ownership is inferred automatically only for a complete spot sweep. Native
 bill, result, product, holding overview and every wallet must conserve exactly.
@@ -7,7 +7,7 @@ Unknown trades, transfers, redemptions and ambiguous mixed partials stay blocked
 
 from copy import deepcopy
 
-from .account_movement_preview import preview, require
+from .account_movement_preview import EXTERNAL_CREDITS, preview, require
 from .account_movement_reconcile import VERSION_ID
 from .account_movement_reconcile import candidate as replay
 from .ledger import money
@@ -36,7 +36,10 @@ def candidate(original, evidence, external_policy=None):  # noqa: C901 - atomic 
     if not moves:
         return deepcopy(original), []
     require(
-        all(row.get("coin") == "USDGO" and row.get("groupType") == "financial" for row in moves),
+        all(
+            row.get("coin") in {"USDGO", "USDC"} and row.get("groupType") == "financial"
+            for row in moves
+        ),
         "location_scope_unverified",
     )
     work = deepcopy(original)
@@ -64,7 +67,10 @@ def candidate(original, evidence, external_policy=None):  # noqa: C901 - atomic 
     proof = deepcopy(evidence)
     overview_coins = [row["coin"] for row in proof["earn_overview"]]
     require(len(overview_coins) == len(set(overview_coins)), "location_overview_duplicate_coin")
-    for coin in ["USDT", "USDGO", "TRX"]:
+    coins = ["USDT", "USDGO", "TRX"]
+    if "USDC" in original["unassigned_offsets"]:
+        coins.append("USDC")
+    for coin in coins:
         if coin not in overview_coins:
             require(
                 not any(
@@ -79,18 +85,25 @@ def candidate(original, evidence, external_policy=None):  # noqa: C901 - atomic 
     manual = [
         row
         for row in review["timeline"]
-        if row["type"] not in {"BATCH_INTEREST_USER_IN", "CASH_COUPON_ACTIVITY_USER_IN"}
+        if row["type"] not in {"BATCH_INTEREST_USER_IN", *EXTERNAL_CREDITS}
     ]
     require(
         manual
-        and all(row["type"] == "SINGLE_USER_OUT" and row["coin"] == "USDGO" for row in manual),
+        and all(
+            row["type"] == "SINGLE_USER_OUT" and row["coin"] in {"USDGO", "USDC"} for row in manual
+        ),
         "location_other_movement_requires_review",
     )
-    selected = {v["product_id"] for v in original["products"] if v["coin"] == "USDGO"}
+    selected = {
+        (v["coin"], v["product_id"])
+        for v in original["products"] + original.get("stablecoin_policy", {}).get("products", [])
+        if v["coin"] in {"USDGO", "USDC"}
+    }
     for row in manual:
         hid = row["holding_id"]
         require(
-            hid in original["holdings"] and original["holdings"][hid]["product_id"] in selected,
+            hid in original["holdings"]
+            and (row["coin"], original["holdings"][hid]["product_id"]) in selected,
             "location_selected_existing_product_required",
         )
         # A mixed partial cannot establish which owner's coins were selected.
@@ -117,7 +130,7 @@ def candidate(original, evidence, external_policy=None):  # noqa: C901 - atomic 
     if (
         current
         and current["status"] not in {"completed", "expired", "failed"}
-        and current["steps"][0].get("coin") == "USDGO"
+        and current["steps"][0].get("coin") in {row["coin"] for row in manual}
     ):
         # The moved funds are already subscribed. Cancel only a proven
         # unsubmitted, single-step idle subscription, never an accepted op.
@@ -149,7 +162,7 @@ def candidate(original, evidence, external_policy=None):  # noqa: C901 - atomic 
     ]
     records = result.setdefault("verified_savings_location_movements", {})
     available = []
-    if external_policy:
+    if external_policy and any(row["coin"] == "USDGO" for row in manual):
         from .external_income_reinvestment import available_sources
 
         source_state = deepcopy(result)
@@ -177,6 +190,8 @@ def candidate(original, evidence, external_policy=None):  # noqa: C901 - atomic 
         outside = money(row["external_amount"])
         sources = {}
         for index, (source, value) in enumerate(available):
+            if row["coin"] != "USDGO":
+                continue
             if result["income_accounting"]["allocations"][source]["timestamp"] > row["timestamp"]:
                 continue
             part = min(outside, value)
@@ -186,7 +201,7 @@ def candidate(original, evidence, external_policy=None):  # noqa: C901 - atomic 
                 available[index] = (source, value - part)
         record = {
             "classification": "verified_savings_location_only",
-            "coin": "USDGO",
+            "coin": row["coin"],
             "business_order_id": oid,
             "bill_ids": row["bill_ids"],
             "holding_id": row["holding_id"],
@@ -216,15 +231,15 @@ def observe(execution, now):
     """Bounded GET-only fallback after a genuine wallet/holding mismatch."""
     state, broker = execution.state, execution.broker
     if state.get("income_accounting", {}).get("status") != "active" or not any(
-        pos.get("coin") == "USDGO" for pos in state.get("holdings", {}).values()
+        pos.get("coin") in {"USDGO", "USDC"} for pos in state.get("holdings", {}).values()
     ):
         return None
     require(broker.account_id() == execution.account_id, "location_account_binding_changed")
     since = state.get("interest_checked_at", state["created_at"])
-    bills = {
-        coin: broker.bills(coin, max(state["created_at"], since - 1), now)
-        for coin in ["USDT", "USDGO", "TRX"]
-    }
+    coins = ["USDT", "USDGO", "TRX"]
+    if "USDC" in state["unassigned_offsets"]:
+        coins.append("USDC")
+    bills = {coin: broker.bills(coin, max(state["created_at"], since - 1), now) for coin in coins}
     moves = [
         row
         for rows in bills.values()
@@ -252,7 +267,10 @@ def observe(execution, now):
         "balances": balances,
         "orders": {},
         "subscription_results": results,
-        "markets": {"USDGOUSDT": broker.market("USDGOUSDT", now)},
+        "markets": {
+            name: broker.market(name, now)
+            for name in (["USDGOUSDT", "USDCUSDT"] if "USDC" in coins else ["USDGOUSDT"])
+        },
     }
     from .external_income_reinvestment import read_policy
 

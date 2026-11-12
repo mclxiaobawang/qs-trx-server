@@ -26,6 +26,7 @@ RECONCILIATION = {
     "v2/spot/trade/fills",
     "v2/spot/account/assets",
     "v2/spot/account/bills",
+    "v2/spot/wallet/withdrawal-records",
     "v2/earn/savings/assets",
     "v2/earn/savings/records",
     "v2/earn/savings/subscribe-result",

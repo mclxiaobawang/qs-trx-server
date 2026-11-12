@@ -57,6 +57,9 @@ class LiveHistory:
         self.account_id = account_id
         self.clock = clock or (lambda: int(time.time() * 1000))
         self.lock = threading.RLock()
+        self.source_lock = threading.Lock()
+        self.source_cache = {}
+        self.synced_groups = {}
         self.archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connection() as db:
             db.executescript(
@@ -81,15 +84,27 @@ class LiveHistory:
     def read_source(self, name):
         path = self.source / (name + ".sqlite")
         try:
-            with closing(
-                sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)
-            ) as db:
+            with (
+                self.source_lock,
+                closing(
+                    sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)
+                ) as db,
+            ):
                 db.execute("PRAGMA query_only=ON")
-                row = db.execute("SELECT state FROM trx_state WHERE id=?", (name,)).fetchone()
-            state = json.loads(row[0]) if row else None
-            if not state or state.get("account_id") != self.account_id:
-                raise HistoryUnavailable("history_account_mismatch")
-            return state
+                inode = path.stat().st_ino
+                version = db.execute("SELECT version FROM trx_state WHERE id=?", (name,)).fetchone()
+                cached = self.source_cache.get(name)
+                if version and cached and cached[:2] == (inode, version[0]):
+                    return cached[2]
+                row = db.execute(
+                    "SELECT version,state FROM trx_state WHERE id=?", (name,)
+                ).fetchone()
+                state = json.loads(row[1]) if row else None
+                if not state or state.get("account_id") != self.account_id:
+                    raise HistoryUnavailable("history_account_mismatch")
+                # All history projections treat source snapshots as read-only.
+                self.source_cache[name] = (inode, row[0], state)
+                return state
         except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
             raise HistoryUnavailable("history_source_unavailable") from exc
 
@@ -123,25 +138,36 @@ class LiveHistory:
                 previous = json.loads(row[0]) if row else {}
             if previous.get("created_at", execution["created_at"]) != execution["created_at"]:
                 raise HistoryUnavailable("history_ledger_mismatch")
-            events = strategy.get("events", [])
-            identities = {r[0] for r in records("strategy", events)}
+            groups = {
+                "strategy": strategy.get("events", []),
+                "execution": execution.get("events", []),
+                "fill": execution["book"].get("orders", []),
+            }
+            changed = {
+                source: items
+                for source, items in groups.items()
+                if self.synced_groups.get(source) != items
+            }
+            if not changed:
+                return strategy, execution
+
             gap = previous.get("possible_strategy_gap", False)
             tail = previous.get("strategy_tail")
-            if len(events) >= 500 and (not tail or tail not in identities):
-                gap = True
+            if "strategy" in changed:
+                identities = [row[0] for row in records("strategy", groups["strategy"])]
+                if len(groups["strategy"]) >= 500 and tail not in identities:
+                    gap = True
+                tail = identities[-1] if identities else None
             self.ingest(
-                {
-                    "strategy": events,
-                    "execution": execution.get("events", []),
-                    "fill": execution["book"].get("orders", []),
-                },
+                changed,
                 metadata={
                     "created_at": execution["created_at"],
                     "last_synced_at": self.clock(),
                     "possible_strategy_gap": gap,
-                    "strategy_tail": list(records("strategy", events))[-1][0] if events else None,
+                    "strategy_tail": tail,
                 },
             )
+            self.synced_groups = groups
 
             return strategy, execution
 

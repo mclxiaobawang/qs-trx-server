@@ -4,6 +4,7 @@ No exchange calls, execution writes or alternative strategy decisions belong her
 """
 
 from copy import deepcopy
+from types import SimpleNamespace
 
 from .ledger import money
 
@@ -141,9 +142,8 @@ def dashboard(state, engine, execution, book, now):
                 sum((money(row["quantity"]) for row in eligible), money(0))
             )
     signal["principal_location_verified"] = location_verified
-    if fx and fx.get("fee") is not None:
-        fee = money(fx["fee"])
-        available = book.free_cash + book.usdgo * money(fx["bid"]) * (1 - fee) / (1 + fee)
+    available = funding_cash_estimate(execution, cfg, quotes, book)
+    if available is not None:
         signal["redeemable_cash_estimate"] = str(available)
         buy_fraction = signal["sides"]["buy"]["target_fraction"]
         signal["sides"]["buy"]["target_budget_estimate"] = (
@@ -153,7 +153,7 @@ def dashboard(state, engine, execution, book, now):
         )
 
     locations = []
-    for coin, total, principal, interest, locked in (
+    location_balances = [
         ("USDT", book.cash, book.cash, money(0), book.locked["USDT"]),
         ("USDGO", book.usdgo, None, None, book.locked["USDGO"]),
         (
@@ -163,7 +163,10 @@ def dashboard(state, engine, execution, book, now):
             book.interest_trx,
             sum((lot.locked for lot in book.lots), money(0)) + book.locked["TRX_INTEREST"],
         ),
-    ):
+    ]
+    if book.usdc_mark is not None or book.usdc:
+        location_balances.append(("USDC", book.usdc, None, None, book.usdc_locked))
+    for coin, total, principal, interest, locked in location_balances:
         holdings = [h for h in execution["holdings"].values() if h["coin"] == coin]
         earn = sum((money(h["principal"]) + money(h["interest"]) for h in holdings), money(0))
         outside = money(execution.get("unassigned_offsets", {}).get(coin, 0)) + sum(
@@ -189,30 +192,53 @@ def dashboard(state, engine, execution, book, now):
             }
         )
 
-    components = None
-    if trx and (not book.usdgo or fx):
-        price = money(trx["bid"])
-        components = {
-            "principal_realized": str(book.realized),
-            "principal_unrealized": str(book.principal * price - book.cost),
-            "trx_interest_value": str(book.interest_trx * price),
-            "interest_sale_proceeds": str(book.interest_sale_proceeds),
-            "stable_interest": str(book.stable_interest),
-            "fx_realized": str(book.fx_profit),
-            "withdrawn_usdgo_profit": str(book.withdrawn_usdgo_profit),
-            "usdgo_unrealized": str(book.usdgo * money(fx["bid"]) - book.usdgo_cost) if fx else "0",
-        }
-        total = book.equity(price) - book.initial - book.external_flows
-        residual = total - sum((money(v) for v in components.values()), money(0))
-        components.update(
-            total=str(total),
-            residual=str(residual),
-            reconciled=abs(residual) <= money("0.00000001"),
-        )
     return {
         "observed_at": now,
         "signal": signal,
         "locations": locations,
-        "attribution": components,
+        "attribution": profit_attribution(book, trx, fx),
         "reconciliation_at": execution.get("interest_checked_at"),
     }
+
+
+def funding_cash_estimate(execution, config, markets, book):
+    if execution.get("stablecoin_policy") is not None:
+        from .live_broker import ExecutionError
+        from .live_funding import LiveFunding
+
+        try:
+            return LiveFunding(execution, SimpleNamespace(**config), markets, {}).available_cash()
+        except (ExecutionError, KeyError, ValueError, ArithmeticError):
+            # A missing market or invalid funding binding makes the estimate unavailable.
+            return None
+    fx = markets.get("USDGOUSDT", {})
+    if fx.get("fee") is None:
+        return None
+    fee = money(fx["fee"])
+    return book.free_cash + book.usdgo * money(fx["bid"]) * (1 - fee) / (1 + fee)
+
+
+def profit_attribution(book, trx, fx):
+    if not trx or (book.usdgo and not fx):
+        return None
+    price = money(trx["bid"])
+    components = {
+        "principal_realized": str(book.realized),
+        "principal_unrealized": str(book.principal * price - book.cost),
+        "trx_interest_value": str(book.interest_trx * price),
+        "interest_sale_proceeds": str(book.interest_sale_proceeds),
+        "stable_interest": str(book.stable_interest),
+        "fx_realized": str(book.fx_profit),
+        "withdrawn_usdgo_profit": str(book.withdrawn_usdgo_profit),
+        "usdgo_unrealized": str(book.usdgo * money(fx["bid"]) - book.usdgo_cost) if fx else "0",
+    }
+    if book.usdc_mark is not None:
+        components["usdc_unrealized"] = str(book.usdc * book.usdc_mark - book.usdc_cost)
+    total = book.equity(price) - book.initial - book.external_flows
+    residual = total - sum((money(v) for v in components.values()), money(0))
+    return dict(
+        components,
+        total=str(total),
+        residual=str(residual),
+        reconciled=abs(residual) <= money("0.00000001"),
+    )

@@ -5,6 +5,10 @@ from decimal import ROUND_UP
 from freqtrade.strategy.trx_phase1.ledger import Ledger, money
 from freqtrade.strategy.trx_phase1.live_broker import ExecutionError, rounded
 from freqtrade.strategy.trx_phase1.live_execution import ProductRule
+from freqtrade.strategy.trx_phase1.stablecoin_policy import (
+    REDEMPTION_SPACING_MS,
+    policy_for,
+)
 
 
 def upward(value, decimals):
@@ -16,7 +20,9 @@ class LiveFunding:
         self.execution, self.config = execution, config
         self.markets, self.terms = markets, terms
         self.book = Ledger.restore(execution["book"])
-        self.rules = {p["coin"]: ProductRule.model_validate(p) for p in execution["products"]}
+        self.policy = policy_for(execution)
+        products = execution["products"] + (self.policy or {}).get("products", [])
+        self.rules = {p["coin"]: ProductRule.model_validate(p) for p in products}
 
     def planning_book(self):
         book = Ledger.restore(self.book.state())
@@ -34,9 +40,13 @@ class LiveFunding:
                 raise ExecutionError("principal_location_mismatch")
             lot.locked = money(0)
         book.usdgo_mark = money(self.markets["USDGOUSDT"]["bid"])
+        if self.policy:
+            book.usdc_mark = money(self.markets["USDCUSDT"]["bid"])
         return book
 
     def available_cash(self):
+        if self.policy:
+            return self.owned_buying_power()
         market = self.markets["USDGOUSDT"]
         fee = money(market["fee"])
         return self.book.free_cash + self.book.usdgo * money(market["bid"]) * (1 - fee) / (1 + fee)
@@ -67,6 +77,120 @@ class LiveFunding:
         if plan is not None:
             result.update(signal_anchor=str(plan.anchor), signal_threshold=str(plan.threshold))
         return result
+
+    def stable_trade(self, coin, side, amount, quote="USDT"):
+        step = self.trade(coin + quote, side, amount)
+        market = self.markets[step["symbol"]]
+        price, fee = money(step["reference_price"]), money(market["fee"])
+        # Limit stablecoin price drift independently of the original TRX protection.
+        deviation = min(money("0.0002"), money(step["maximum_deviation"]))
+        step["maximum_deviation"] = str(deviation)
+        precision = market["price_decimals"] if side == "buy" else market["quantity_decimals"]
+        tradable = rounded(amount / (1 + fee), precision)
+        step["minimum_receive"] = str(
+            tradable * (1 - fee) / (price * (1 + deviation))
+            if side == "buy"
+            else tradable * (1 - fee) * price * (1 - deviation)
+        )
+        return step
+
+    def stable_spot(self, coin):
+        if coin == "USDT":
+            return self.book.free_cash
+        if coin == "USDC":
+            return self.book.usdc - self.book.usdc_locked
+        return self.book.usdgo - self.book.locked["USDGO"]
+
+    def stable_holding_amount(self, position, outside):
+        if outside:
+            from freqtrade.strategy.trx_phase1.external_stablecoin import holding_amount
+
+            return holding_amount(position)
+        return money(position["principal"])
+
+    def redeemable_stable(self, coin, *, outside=False):
+        rule = self.rules[coin]
+        if rule.redemption_minimum is None:
+            return money(0)
+        amounts = (
+            rounded(self.stable_holding_amount(p, outside), rule.redemption_decimals)
+            for p in self.execution["holdings"].values()
+            if p["coin"] == coin and p["product_id"] == rule.product_id
+        )
+        return sum((q for q in amounts if q >= rule.redemption_minimum), money(0))
+
+    def owned_buying_power(self):
+        total = self.book.free_cash
+        for coin in ("USDT", "USDC", "USDGO"):
+            amount = money(0) if coin == "USDT" else self.stable_spot(coin)
+            amount += self.redeemable_stable(coin)
+            if coin == "USDT":
+                total += amount
+            elif amount:
+                total += money(self.stable_trade(coin, "sell", amount)["minimum_receive"])
+        return total
+
+    def redeem_stable(self, coin, required, *, outside=False):
+        rule = self.rules[coin]
+        if rule.redemption_minimum is None:
+            raise ExecutionError("redemption_terms_unverified")
+        steps = []
+        for key, position in sorted(self.execution["holdings"].items()):
+            if required <= 0:
+                break
+            if position["coin"] != coin or position["product_id"] != rule.product_id:
+                continue
+            owned = rounded(self.stable_holding_amount(position, outside), rule.redemption_decimals)
+            amount = min(
+                owned, upward(max(required, rule.redemption_minimum), rule.redemption_decimals)
+            )
+            if amount >= rule.redemption_minimum:
+                steps.append(self.redemption(coin, amount, key))
+                required -= amount
+        if required > 0:
+            raise ExecutionError("stablecoin_owned_redemption_unavailable")
+        return steps
+
+    def buy_funding(self, plan, now):
+        budget = money(plan.budget)
+        gap = max(money(0), budget - self.book.free_cash)
+        steps, exchanges = [], []
+        redeemable_usdt = self.redeemable_stable("USDT")
+        if gap and redeemable_usdt:
+            amount = min(gap, redeemable_usdt)
+            try:
+                steps = self.redeem_stable("USDT", amount)
+            except ExecutionError:
+                pass
+            else:
+                gap = max(money(0), gap - sum((money(s["amount"]) for s in steps), money(0)))
+        for coin in ("USDC", "USDGO"):
+            if not gap:
+                break
+            market = self.markets[coin + "USDT"]
+            rate = money(self.stable_trade(coin, "sell", money(1))["minimum_receive"])
+            spot = self.stable_spot(coin)
+            available = spot + self.redeemable_stable(coin)
+            decimals = market["quantity_decimals"]
+            minimum = money(market["minimum_notional"]) / money(market["bid"])
+            amount = min(upward(max(gap / rate, minimum), decimals), rounded(available, decimals))
+            if amount < minimum:
+                continue
+            if amount > spot:
+                try:
+                    steps.extend(self.redeem_stable(coin, amount - spot))
+                except ExecutionError:
+                    amount = rounded(spot, decimals)
+            if amount >= minimum:
+                exchange = self.stable_trade(coin, "sell", amount)
+                exchanges.append(exchange)
+                gap = max(money(0), gap - money(exchange["minimum_receive"]))
+        if gap:
+            raise ExecutionError("stablecoin_buy_funding_unavailable")
+        # Earliest possible admission, not an assumed venue arrival guarantee.
+        if steps and now + (len(steps) - 1) * REDEMPTION_SPACING_MS >= plan.expires_at:
+            raise ExecutionError("stablecoin_buy_funding_window_too_short")
+        return [*steps, *exchanges, self.trade("TRXUSDT", "buy", budget, plan)]
 
     def subscribe(self, coin, amount, source="principal"):
         return {
@@ -142,12 +266,14 @@ class LiveFunding:
             raise ExecutionError("redeemable_profitable_principal_unavailable")
         return steps
 
-    def for_plan(self, plan):
+    def for_plan(self, plan, now=None):
         if plan.side == "sell":
             return [
                 *self.redeem_trx(plan.allocations),
                 self.trade("TRXUSDT", "sell", money(plan.quantity), plan),
             ]
+        if self.policy:
+            return self.buy_funding(plan, plan.created_at if now is None else now)
         budget = money(plan.budget)
         shortage = max(money(0), budget - self.book.free_cash)
         steps = []
@@ -177,6 +303,16 @@ class LiveFunding:
         terms = self.terms[coin]
         value = rounded(
             min(money(amount), money(terms["singleMaxAmount"]), money(terms["remainingAmount"])),
+            int(terms["subscribePrecision"]),
+        )
+        return value if value >= money(terms["singleMinAmount"]) else money(0)
+
+    def subscription(self, coin, amount, observed):
+        terms = observed[coin]
+        if amount <= 0 or self.rules[coin].redemption_minimum is None:
+            return money(0)
+        value = rounded(
+            min(amount, money(terms["singleMaxAmount"]), money(terms["remainingAmount"])),
             int(terms["subscribePrecision"]),
         )
         return value if value >= money(terms["singleMinAmount"]) else money(0)
@@ -212,6 +348,8 @@ class LiveFunding:
             amount = self.eligible_subscription("TRX", amount)
             if amount and self.apr_income("TRX", amount) > 0:
                 return [self.subscribe("TRX", amount, source)]
+        if self.policy:
+            return []
         usdgo = self.eligible_subscription("USDGO", self.book.usdgo - self.book.locked["USDGO"])
         if usdgo and self.apr_income("USDGO", usdgo) > 0:
             return [self.subscribe("USDGO", usdgo)]

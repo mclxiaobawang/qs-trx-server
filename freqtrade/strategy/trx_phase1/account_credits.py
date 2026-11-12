@@ -60,6 +60,12 @@ def quarantine_coin(execution, book, receipts, records, now, coin, bills):
         if known_movement_bill(execution, raw) or known_account_credit(execution, receipts, raw):
             continue
         kind = raw.get("businessType")
+        if (
+            kind == "BATCH_INTEREST_USER_IN"
+            and execution.state.get("stablecoin_policy")
+            and int(raw["cTime"]) >= execution.state["stablecoin_policy"]["starts_at"]
+        ):
+            continue  # Accounted by the native stablecoin income allocator.
         if kind not in kinds:
             continue
         row = execution.interest_bill(raw)
@@ -167,7 +173,7 @@ def validate_movements(execution, receipts, records, coin, bills, kinds):
             continue
         if raw.get("groupType") == "transaction" and str(raw.get("bizOrderId")) in known_fills:
             continue
-        if coin != "USDT":
+        if coin != "USDT" or execution.state.get("stablecoin_policy"):
             bill_id = str(raw.get("billId"))
             if raw.get("groupType") == "financial" and (
                 (

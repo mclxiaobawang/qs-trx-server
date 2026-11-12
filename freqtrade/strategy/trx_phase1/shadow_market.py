@@ -20,6 +20,14 @@ PUBLIC_PATHS = {
 }
 
 
+class PublicMarketDataError(ValueError):
+    """An unusable public response that must be discarded before trading."""
+
+    def __init__(self, code, stage, context):
+        super().__init__(code)
+        self.stage, self.context = stage, context
+
+
 class PublicBitget(LimitedReadMixin, ccxt.bitget):
     def request(
         self, path, api="public", method="GET", params=None, headers=None, body=None, config=None
@@ -40,6 +48,8 @@ class PublicShadowMarket:
             self.client._shared_limiter = limiter
         self.client.request_priority = 2
         self.provisional = {}
+        self.request_stage = None
+        self.diagnostic_context = {}
 
     def close(self):
         self.client.close()
@@ -51,22 +61,65 @@ class PublicShadowMarket:
         return response["data"]
 
     def snapshot(self):
-        server = int(self.client.fetch_time())
+        self.request_stage = "public_time"
+        self.diagnostic_context = {"path": "v2/public/time"}
+        raw_time = self.client.fetch_time()
+        try:
+            server = int(raw_time)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PublicMarketDataError(
+                "public_clock_response_invalid", self.request_stage, {"value": str(raw_time)[:120]}
+            ) from exc
         local = int(time.time() * 1000)
         if abs(local - server) > 30000:
             raise ValueError("market_clock_mismatch")
-        raw = self.data(
-            self.client.publicSpotGetV2SpotMarketOrderbook(
-                {"symbol": "TRXUSDT", "type": "step0", "limit": "20"}
-            )
+        self.request_stage = "public_orderbook_read"
+        self.diagnostic_context = {"path": "v2/spot/market/orderbook", "symbol": "TRXUSDT"}
+        response = self.client.publicSpotGetV2SpotMarketOrderbook(
+            {"symbol": "TRXUSDT", "type": "step0", "limit": "20"}
         )
-        quote = {
-            "timestamp": int(raw["ts"]),
-            "asks": [[float(p), float(q)] for p, q in raw["asks"]],
-            "bids": [[float(p), float(q)] for p, q in raw["bids"]],
-        }
+        self.request_stage = "public_orderbook_parse"
+        try:
+            if not isinstance(response, dict):
+                raise TypeError("Public orderbook response must be an object")
+            raw = self.data(response)
+            if not isinstance(raw, dict):
+                raise TypeError("Public orderbook data must be an object")
+            self.diagnostic_context.update(
+                response_code=response.get("code"),
+                timestamp=str(raw.get("ts"))[:40],
+                fields=sorted(str(key) for key in raw)[:20],
+                asks=str(raw.get("asks"))[:1200],
+                bids=str(raw.get("bids"))[:1200],
+            )
+            quote = {
+                "timestamp": int(raw["ts"]),
+                "asks": [[float(p), float(q)] for p, q in raw["asks"]],
+                "bids": [[float(p), float(q)] for p, q in raw["bids"]],
+            }
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            if str(exc) == "public_market_response_failed":
+                raise
+            raise PublicMarketDataError(
+                "public_orderbook_response_invalid",
+                self.request_stage,
+                self.diagnostic_context.copy(),
+            ) from exc
         now = int(time.time() * 1000)
-        validate_quote(quote, now)
+        self.request_stage = "public_orderbook_validate"
+        try:
+            validate_quote(quote, now)
+        except ValueError as exc:
+            if str(exc) not in {
+                "stale_execution_quote",
+                "invalid_orderbook",
+                "crossed_orderbook",
+                "unsorted_orderbook",
+            }:
+                raise
+            raise PublicMarketDataError(
+                str(exc), self.request_stage, self.diagnostic_context.copy()
+            ) from exc
         return now, quote
 
     def rules(self):
@@ -91,6 +144,8 @@ class PublicShadowMarket:
         return result
 
     def update(self, existing, now):
+        self.request_stage = "public_minute_update"
+        self.diagnostic_context = {"path": "v2/spot/market/candles", "symbol": "TRXUSDT"}
         last = int(pd.Timestamp(existing.date.iloc[-1]).timestamp() * 1000)
         if now - last > 30 * 86400000:
             raise ValueError("shadow_history_too_old")
@@ -98,6 +153,8 @@ class PublicShadowMarket:
             return existing
         rows, end = [], now
         for page_number in range(250):
+            self.request_stage = "public_minute_read"
+            self.diagnostic_context.update(page=page_number, end_time=end)
             fetch = (
                 self.client.publicSpotGetV2SpotMarketCandles
                 if page_number == 0
@@ -118,6 +175,7 @@ class PublicShadowMarket:
             rows.extend(page)
             earliest = min(int(row[0]) for row in page)
             if earliest <= last:
+                self.request_stage = "public_minute_validate"
                 incoming = frame_from_rows(rows)
                 duplicates = incoming[incoming.duplicated("date", keep=False)]
                 if len(duplicates) and (duplicates.groupby("date").nunique() > 1).any().any():

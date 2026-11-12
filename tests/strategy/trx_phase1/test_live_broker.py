@@ -197,6 +197,18 @@ def test_post_error_classification_is_conservative(transport, code, expected):
     assert transport.session.request.call_count == 1
 
 
+@pytest.mark.parametrize("code", ["59033", "59034", "59035"])
+def test_savings_redemption_term_rejection_is_definitive(transport, code):
+    transport.session.request.return_value.json = lambda: {"code": code}
+    with pytest.raises(WriteRejected, match=code):
+        transport.call(
+            "POST",
+            "v2/earn/savings/redeem",
+            {"productId": "123", "orderId": "456", "periodType": "flexible", "amount": "0.10"},
+        )
+    assert transport.session.request.call_count == 1
+
+
 def test_uta_credentials_do_not_construct_a_classic_execution_client():
     with pytest.raises(ExecutionError, match="classic_account_required"):
         ClassicTransport(AccountSettings(account_type="uta"))
@@ -375,8 +387,8 @@ def test_quote_freshness_uses_observation_time_after_slow_prior_reads(mocker):
                 "minTradeUSDT": "1",
             }
         ],
-        {"ts": "1792166405000", "bids": [["1.001", "1000"]], "asks": [["1.002", "1000"]]},
         {"takerFeeRate": "0"},
+        {"ts": "1792166405000", "bids": [["1.001", "1000"]], "asks": [["1.002", "1000"]]},
     ]
     broker = ClassicBroker(t, clock=lambda: 1792166405100)
     assert broker.market("USDGOUSDT", 1792166400000)["timestamp"] == 1792166405000
@@ -400,3 +412,22 @@ def test_documented_second_precision_fill_times_are_normalized(mocker):
         ClassicBroker(t).fills("order", "TRXUSDT", 1792166400000, 1792166401000)[0]["timestamp"]
         == 1792166400000
     )
+
+
+def test_read_error_retains_api_message_without_changing_error_code(transport):
+    transport.session.request.return_value.json = lambda: {
+        "code": "40014",
+        "msg": "Product detail temporarily unavailable",
+        "data": None,
+    }
+    with pytest.raises(ExecutionError, match="exchange_read_40014") as found:
+        transport.call(
+            "GET", "v2/earn/savings/subscribe-info", {"productId": "123", "periodType": "flexible"}
+        )
+    assert found.value.read_diagnostic == {
+        "path": "v2/earn/savings/subscribe-info",
+        "http_status": 200,
+        "code": "40014",
+        "message": "Product detail temporarily unavailable",
+    }
+    assert all(call.args[0] == "GET" for call in transport.session.request.call_args_list)

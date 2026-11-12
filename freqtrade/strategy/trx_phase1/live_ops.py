@@ -225,15 +225,23 @@ def activity_summary(execution, now):
     ]
     allocations = (execution.get("income_accounting") or {}).get("allocations", {})
     income = {}
-    for row in allocations.values():
-        key = "income-allocation:" + row["bill_id"]
+    for receipt_id, row in allocations.items():
+        key = (
+            receipt_id
+            if receipt_id.startswith("income-product-batch:")
+            else "income-allocation:" + row["bill_id"]
+        )
         if key in book.events:
             income[key] = row
     for row in execution.get("events", []):
         key = row.get("receipt_id")
         if row["kind"] == "credited_interest_imported" and key in book.events:
             income.setdefault(key, row)
-    credited_keys = {k for k in book.events if k.startswith(("income:", "income-allocation:"))}
+    credited_keys = {
+        k
+        for k in book.events
+        if k.startswith(("income:", "income-allocation:", "income-product-batch:"))
+    }
     complete_income = credited_keys == income.keys()
     # Refuse a plausible but incomplete fee/PnL subtotal if older evidence is missing.
     fees = sum((money(r["fee"]) for r in fills.values()), money(0)) + sum(
@@ -247,7 +255,7 @@ def activity_summary(execution, now):
     periods = {}
     for name, start in starts.items():
         selected = [r for r in fills.values() if start <= r["timestamp"] <= now]
-        native = {c: money(0) for c in ("TRX", "USDGO", "USDT")}
+        native = {c: money(0) for c in ("TRX", "USDGO", "USDT", "USDC")}
         for row in income.values():
             if start <= row["timestamp"] <= now:
                 native[row["coin"]] += money(row["amount"])
@@ -325,6 +333,24 @@ def recovery_status(code, state, execution, metrics):
         status = "自动备份已恢复更新" if code == "backup_stale" else "自动备份错误状态已清除"
         return f"{status}；最近成功时间：{beijing_time(backup.get('last_success_at'))}。"
     return "该项监测告警已解除，请在真实账户页面查看其他运行指标。"
+
+
+def external_usdc_savings(execution):
+    """Project verified external savings without including them in strategy assets."""
+    external = execution.get("external_usdc")
+    if not isinstance(external, dict) or external.get("outside_strategy") is not True:
+        return None
+    try:
+        quantity = money(external["savings"])
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return None
+    if not quantity.is_finite() or quantity < 0:
+        return None
+    checked_at = execution.get("external_movements_checked_at")
+    return {
+        "quantity": format(quantity, "f"),
+        "checked_at": checked_at if type(checked_at) is int and checked_at > 0 else None,
+    }
 
 
 def read_state(path, key):
@@ -469,6 +495,8 @@ class LiveView:
         markets = state.get("markets", {})
         if book.usdgo:
             book.usdgo_mark = money(markets["USDGOUSDT"]["bid"])
+        if markets.get("USDCUSDT", {}).get("bid") is not None:
+            book.usdc_mark = money(markets["USDCUSDT"]["bid"])
         result = {
             k: deepcopy(state.get(k))
             for k in (
@@ -532,6 +560,7 @@ class LiveView:
         result["decisions"] = state.get("decisions", [])[-10:]
         result["evaluations"] = state.get("evaluations", [])[-12:]
         result["dashboard"] = dashboard(state, engine, execution, book, now)
+        result["external_usdc_savings"] = external_usdc_savings(execution)
         adopted = bool(execution.get("opening_adoption"))
         if adopted:
             basis = execution.get("performance_basis")

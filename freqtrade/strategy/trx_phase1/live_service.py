@@ -378,11 +378,12 @@ class LiveService:
             execution = state.pop("execution")
             engine = state.pop("engine")
             book = Ledger.restore(execution["book"])
-            price = (
-                state.get("markets", {}).get("TRXUSDT", {}).get("bid", engine["last_price"] or 1)
-            )
+            quotes = state.get("markets", {})
+            price = quotes.get("TRXUSDT", {}).get("bid", engine["last_price"] or 1)
             if book.usdgo:
-                book.usdgo_mark = money(state["markets"]["USDGOUSDT"]["bid"])
+                book.usdgo_mark = money(quotes["USDGOUSDT"]["bid"])
+            if quotes.get("USDCUSDT", {}).get("bid") is not None:
+                book.usdc_mark = money(quotes["USDCUSDT"]["bid"])
             state["summary"] = book.summary(price)
             observations = runtime.store.observations()
             state.update(observations)
@@ -397,7 +398,6 @@ class LiveService:
                 ),
                 max_drawdown=observations["history"]["max_drawdown"],
             )
-            quotes = state.get("markets", {})
             quote_times = [int(q["timestamp"]) for q in quotes.values() if q.get("timestamp")]
             state["valuation"] = {
                 "observed_at": min(quote_times) if quote_times else None,
@@ -1104,8 +1104,12 @@ class LiveService:
                     runtime.sync_book(funding)
                     runtime.capture_observation(self.clock())
                 if runtime.state["phase"] == "blocked" and not runtime.state["intent"]:
-                    runtime.state.update(phase="paused", error=None, evidence_wait_started_at=None,
-                                         evidence_wait_last_seen_at=None)
+                    runtime.state.update(
+                        phase="paused",
+                        error=None,
+                        evidence_wait_started_at=None,
+                        evidence_wait_last_seen_at=None,
+                    )
                 runtime.persist()
                 return self.status()
             finally:

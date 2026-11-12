@@ -12,6 +12,11 @@ from .live_broker import ExecutionError
 
 COINS = ("USDT", "USDGO", "TRX")
 UNIT = money("0.00000001")
+EXTERNAL_CREDITS = {
+    "CASH_COUPON_ACTIVITY_USER_IN": "outside_strategy_cash_coupon_reward",
+    "REBATE_REWARDS": "strategy_order_link_unverified",
+    "REBATE_COUPON_ACTIVITY_USER_IN": "outside_strategy_rebate_coupon_reward",
+}
 
 
 def require(condition, code):
@@ -34,6 +39,7 @@ def _preview(execution, evidence):  # noqa: C901 - chronological conservation pr
     )
     require(not execution.get("operation"), "preview_execution_in_flight")
     book = Ledger.restore(execution["book"])
+    coins = (*COINS, "USDC") if "USDC" in execution["unassigned_offsets"] else COINS
     since, until = execution["interest_checked_at"], evidence["observed_at_ms"]
     require(since <= until, "preview_invalid_window")
     spot = {
@@ -53,6 +59,11 @@ def _preview(execution, evidence):  # noqa: C901 - chronological conservation pr
             "external": quantity(execution["unassigned_offsets"]["TRX"]),
         },
     }
+    if "USDC" in coins:
+        spot["USDC"] = {
+            "strategy": book.usdc - book.usdc_locked,
+            "external": quantity(execution["unassigned_offsets"]["USDC"]),
+        }
     positions = {
         key: {
             "coin": p["coin"],
@@ -66,7 +77,7 @@ def _preview(execution, evidence):  # noqa: C901 - chronological conservation pr
     require(bool(history), "preview_hourly_ownership_history_required")
     rows, seen = [], {}
     for coin, bills in evidence["bills"].items():
-        require(coin in COINS, "preview_unexpected_coin")
+        require(coin in coins, "preview_unexpected_coin")
         for raw in bills:
             require(raw.get("coin") == coin, "preview_bill_coin_mismatch")
             key = str(raw["billId"])
@@ -120,10 +131,17 @@ def _preview(execution, evidence):  # noqa: C901 - chronological conservation pr
             "account_amount": str(amount),
         }
         native_legs = [row]
-        if kind == "CASH_COUPON_ACTIVITY_USER_IN":
+        if kind in EXTERNAL_CREDITS:
             require(
                 coin == "USDT" and group == "other" and amount > 0,
                 "preview_reward_evidence_invalid",
+            )
+            require(amount % UNIT == 0, "preview_reward_precision_invalid")
+            from .account_credits import rebate_coupon_link
+            from .live_execution import LiveExecution
+
+            detail.update(
+                rebate_coupon_link(LiveExecution.interest_bill(row), execution.get("receipts", {}))
             )
             spot[coin]["external"] += amount
             detail.update(
@@ -291,9 +309,22 @@ def _preview(execution, evidence):  # noqa: C901 - chronological conservation pr
 
     wallet_checks, holding_checks = [], []
     overview = {r["coin"]: quantity(r["amount"]) for r in evidence["earn_overview"]}
-    for coin in COINS:
+    for coin in coins:
         actual = sum((quantity(v) for v in evidence["balances"][coin].values()), money(0))
         expected = sum(spot[coin].values(), money(0))
+        account_credits = [
+            row for row in timeline if row["coin"] == coin and row["type"] in EXTERNAL_CREDITS
+        ]
+        if coin == "USDT" and account_credits and actual != expected:
+            # Match the existing native account-credit precision rule. Only a
+            # sub-eight-decimal residue may remain outside; USDC stays exact.
+            residual = actual - expected
+            require(
+                abs(residual) < UNIT * len(account_credits), "preview_wallet_conservation_failed"
+            )
+            account_credits[-1]["precision_residual"] = str(residual)
+            spot[coin]["external"] += residual
+            expected += residual
         require(actual == expected, "preview_wallet_conservation_failed")
         wallet_checks.append(
             {

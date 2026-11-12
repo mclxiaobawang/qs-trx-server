@@ -167,9 +167,7 @@ def test_actual_activation_or_performance_start_precedes_execution_container_cre
 def test_cost_route_is_authenticated_account_bound_and_get_only(source, tmp_path):
     path, execution, strategy = source
     for name, state in [("execution", execution), ("strategy", strategy)]:
-        with closing(sqlite3.connect(path / f"{name}.sqlite")) as db, db:
-            db.execute("CREATE TABLE trx_state(id TEXT PRIMARY KEY,state TEXT)")
-            db.execute("INSERT INTO trx_state VALUES(?,?)", (name, json.dumps(state)))
+        StateStore(path / f"{name}.sqlite").save(name, 0, state)
     history = LiveHistory(path, tmp_path / "archive/history.sqlite", "account")
     secret = "cost-test-secret-which-is-longer-than-thirty-two-bytes"
     client = TestClient(

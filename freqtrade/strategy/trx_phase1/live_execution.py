@@ -24,6 +24,7 @@ from freqtrade.strategy.trx_phase1.ledger import Ledger, StateStore, money
 from freqtrade.strategy.trx_phase1.live_broker import (
     COINS,
     DAY,
+    STABLECOIN_SYMBOLS,
     SYMBOLS,
     ExecutionError,
     WriteNotSent,
@@ -57,7 +58,7 @@ def allocation_lock(root):
 
 class ProductRule(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    coin: Literal["TRX", "USDGO"]
+    coin: Literal["TRX", "USDGO", "USDT", "USDC"]
     product_id: str
     # Subscription minimum/precision do not establish redemption rules. Empty
     # product API fields are not the backtest's assumed one-minute delay.
@@ -79,12 +80,14 @@ class ExecutionStep(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     kind: Literal["trade", "subscribe", "redeem"]
     amount: Decimal | Literal["previous"]
-    symbol: Literal["TRXUSDT", "USDGOUSDT"] | None = None
+    symbol: Literal["TRXUSDT", "USDGOUSDT", "USDCUSDT", "USDGOUSDC"] | None = None
     side: Literal["buy", "sell"] | None = None
-    coin: Literal["TRX", "USDGO"] | None = None
+    coin: Literal["TRX", "USDGO", "USDT", "USDC"] | None = None
     product_id: str | None = None
     holding_id: str | None = None
-    source: Literal["principal", "interest", "external_interest"] = "principal"
+    source: Literal["principal", "interest", "external_interest", "external_stablecoin"] = (
+        "principal"
+    )
     external_income_sources: dict[str, Decimal] = Field(default_factory=dict)
     external_income_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     reference_price: Decimal | None = Field(default=None, gt=0)
@@ -95,9 +98,16 @@ class ExecutionStep(BaseModel):
     signal_anchor: Decimal | None = Field(default=None, gt=0)
     signal_threshold: Decimal | None = Field(default=None, gt=0, lt=1)
     redeem_lots: dict[str, Decimal] = Field(default_factory=dict)
+    minimum_marginal_apr: Decimal | None = Field(default=None, ge=0, le=1)
 
     @model_validator(mode="after")
     def funding_guards(self):
+        if self.minimum_marginal_apr is not None and (
+            self.kind != "subscribe"
+            or self.coin not in {"USDT", "USDGO", "USDC"}
+            or self.source not in {"principal", "external_stablecoin"}
+        ):
+            raise ValueError("Marginal APR protection applies to stablecoin placement")
         if (self.signal_anchor is None) != (self.signal_threshold is None):
             raise ValueError("Signal guard requires both anchor and threshold")
         if self.signal_anchor is not None and (self.kind != "trade" or self.symbol != "TRXUSDT"):
@@ -114,7 +124,7 @@ class ExecutionStep(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def complete_request(self):
+    def complete_request(self):  # noqa: C901 - exhaustive request scope checks
         if self.amount != "previous":
             positive(self.amount)
         if self.source == "external_interest":
@@ -132,12 +142,17 @@ class ExecutionStep(BaseModel):
                 )
         elif self.external_income_sources or self.external_income_policy_sha256:
             raise ValueError("External income evidence requires its dedicated source")
+        if self.external and (
+            (self.kind == "trade" and self.symbol not in {"USDCUSDT", "USDGOUSDT", "USDGOUSDC"})
+            or (self.kind != "trade" and self.coin not in {"USDT", "USDGO", "USDC"})
+        ):
+            raise ValueError("External stablecoin workflows may only move stablecoins")
         if self.kind == "trade":
             if not self.symbol or not self.side or self.reference_price is None:
                 raise ValueError("Trade requires symbol, side and reviewed reference price")
             if self.minimum_receive <= 0:
                 raise ValueError("Trade requires a positive minimum net receipt")
-            if self.source != "principal":
+            if self.source not in {"principal", "external_stablecoin"}:
                 raise ValueError("Ordinary execution never sells retained TRX interest")
         elif not self.coin or not self.product_id:
             raise ValueError("Savings requires an explicit coin and product ID")
@@ -148,16 +163,28 @@ class ExecutionStep(BaseModel):
         return self
 
     @property
+    def external(self):
+        return self.source == "external_stablecoin"
+
+    @property
+    def quote_coin(self):
+        return "USDC" if self.symbol == "USDGOUSDC" else "USDT"
+
+    def saved(self):
+        exclude = {"minimum_marginal_apr"} if self.minimum_marginal_apr is None else None
+        return self.model_dump(mode="json", exclude=exclude)
+
+    @property
     def input_coin(self):
         if self.kind != "trade":
             return self.coin
-        return "USDT" if self.side == "buy" else SYMBOLS[self.symbol]
+        return self.quote_coin if self.side == "buy" else SYMBOLS[self.symbol]
 
     @property
     def output_coin(self):
         if self.kind != "trade":
             return self.coin
-        return SYMBOLS[self.symbol] if self.side == "buy" else "USDT"
+        return SYMBOLS[self.symbol] if self.side == "buy" else self.quote_coin
 
 
 class LiveExecution:
@@ -170,6 +197,17 @@ class LiveExecution:
         self.path.chmod(0o600)
         self.broker, self.account_id = broker, account_id
         self.version, self.state = self.store.load("execution")
+        self.configure_stablecoins()
+
+    def configure_stablecoins(self):
+        if self.broker is not None and hasattr(self.broker, "include_usdc"):
+            self.broker.include_usdc = self.stablecoin_policy is not None
+
+    @property
+    def stablecoin_policy(self):
+        from freqtrade.strategy.trx_phase1.stablecoin_policy import policy_for
+
+        return policy_for(self.state)
 
     @classmethod
     def create(cls, root, broker, capital, products, now):
@@ -250,6 +288,7 @@ class LiveExecution:
         self.version, self.state = self.store.load("execution")
         if self.state and self.state["account_id"] != self.account_id:
             raise ExecutionError("account_binding_mismatch")
+        self.configure_stablecoins()
 
     def save(self):
         self.version = self.store.save("execution", self.version, self.state)
@@ -269,7 +308,9 @@ class LiveExecution:
         if self.state.get("opening_adoption") and not self.state.get("performance_basis"):
             raise ExecutionError("actual_start_basis_required")
 
-    def queue(self, steps, *, now, expires_at, label, strategy_snapshot=None, intent_id=None):
+    def queue(  # noqa: C901 - single locked flow admission
+        self, steps, *, now, expires_at, label, strategy_snapshot=None, intent_id=None
+    ):
         self.require_trading_authorized()
         if strategy_snapshot is not None:
             verified = ResearchConfig.from_saved(strategy_snapshot).model_dump()
@@ -287,6 +328,19 @@ class LiveExecution:
                 raise ExecutionError("subscribed_funds_are_not_spendable")
         with self.exclusive():
             self.reload()
+            if any(s.external for s in steps):
+                from freqtrade.strategy.trx_phase1.external_stablecoin import authorize
+
+                if not all(s.external for s in steps):
+                    raise ExecutionError("mixed_stablecoin_flow_ownership")
+                authorize(self)
+            if not self.stablecoin_policy and any(
+                s.symbol in {"USDCUSDT", "USDGOUSDC"}
+                or s.coin in {"USDT", "USDC"}
+                or s.minimum_marginal_apr is not None
+                for s in steps
+            ):
+                raise ExecutionError("stablecoin_policy_not_enabled")
             if intent_id is not None:
                 identifier(intent_id)
                 matches = [
@@ -296,7 +350,7 @@ class LiveExecution:
                 ]
                 if matches:
                     if (
-                        matches[0]["steps"] != [s.model_dump(mode="json") for s in steps]
+                        matches[0]["steps"] != [s.saved() for s in steps]
                         or matches[0]["strategy_snapshot"] != strategy_snapshot
                     ):
                         raise ExecutionError("strategy_intent_conflict")
@@ -318,7 +372,7 @@ class LiveExecution:
                 "label": label,
                 "created_at": now,
                 "expires_at": expires_at,
-                "steps": [s.model_dump(mode="json") for s in steps],
+                "steps": [s.saved() for s in steps],
                 "index": 0,
                 "status": "queued",
                 "outputs": [],
@@ -329,6 +383,32 @@ class LiveExecution:
             self.event("flow_queued", now, flow_id=flow_id)
             self.save()
             return flow_id
+
+    @staticmethod
+    def stablecoin_conversion(step):
+        return step["kind"] == "trade" and step.get("symbol") in STABLECOIN_SYMBOLS
+
+    def defer_rebalance_quote(self, flow, code, now):
+        """Bound fresh-quote checks for an unsent automatic conversion."""
+        if (
+            flow["label"] != "C1 live · stablecoin_rebalance"
+            or code not in {"quote_stale", "quote_expired_during_preflight"}
+            or flow["index"] >= len(flow["steps"])
+            or not self.stablecoin_conversion(flow["steps"][flow["index"]])
+            or (self.state["operation"] or {}).get("status") not in {None, "prepared"}
+        ):
+            return False
+        prior = flow.get("rebalance_quote_failures") or {}
+        count = (prior.get("count", 0) if prior.get("index") == flow["index"] else 0) + 1
+        flow["rebalance_quote_failures"] = {"index": flow["index"], "count": count}
+        self.event(
+            "stablecoin_rebalance_quote_wait", now, flow_id=flow["id"], code=code, count=count
+        )
+        if count >= 3:
+            self.state["operation"] = None
+            flow.update(status="expired", rebalance_quote_deferred=True)
+            self.event("stablecoin_rebalance_quote_deferred", now, flow_id=flow["id"], code=code)
+        return True
 
     def tick(self, now):
         """One bounded step. No automatic write resubmissions or retrospective signals."""
@@ -361,7 +441,8 @@ class LiveExecution:
             except ExecutionError as exc:
                 # A read failure is not a negative acknowledgement. Retain every
                 # reservation and operation for the next bounded recovery poll.
-                self.event("read_or_reconciliation_blocked", now, code=str(exc))
+                if not self.defer_rebalance_quote(flow, str(exc), now):
+                    self.event("read_or_reconciliation_blocked", now, code=str(exc))
                 self.save()
             except Exception:
                 self.event(
@@ -370,7 +451,7 @@ class LiveExecution:
                 self.save()
 
     def owned_spot(self, book):
-        return {
+        balances = {
             "USDT": book.free_cash,
             "USDGO": book.usdgo - book.locked["USDGO"],
             "TRX": book.principal
@@ -378,6 +459,9 @@ class LiveExecution:
             - sum((lot.locked for lot in book.lots), money(0))
             - book.locked["TRX_INTEREST"],
         }
+        if self.stablecoin_policy:
+            balances["USDC"] = book.usdc - book.usdc_locked
+        return balances
 
     def check_wallet(self, balances, book, income_records=()):
         offsets, _ = self.income_adjustments(income_records)
@@ -398,7 +482,7 @@ class LiveExecution:
     def product_rule(self, step):
         matches = [
             p
-            for p in self.state["products"]
+            for p in self.state["products"] + (self.stablecoin_policy or {}).get("products", [])
             if p["coin"] == step.coin and p["product_id"] == step.product_id
         ]
         if len(matches) != 1:
@@ -446,11 +530,18 @@ class LiveExecution:
         if flow["status"] == "expired":
             raise ExecutionError("idle_flow_superseded_by_verified_location")
         self.commit_candidate(book, positions, receipts, income_records, verified_at, accounting)
+        if step.external:
+            from freqtrade.strategy.trx_phase1.external_stablecoin import authorize, spendable
+
+            authorize(self)
+            source_spot = spendable(self, balances, book, step.input_coin)
+        else:
+            source_spot = self.owned_spot(book)[step.input_coin]
         client_id = "trx-" + digest([self.account_id, flow["id"], flow["index"]])[:32]
         op = {
             "id": client_id,
             "kind": step.kind,
-            "step": step.model_dump(mode="json"),
+            "step": step.saved(),
             "amount": str(amount),
             "created_at": now,
             "status": "prepared",
@@ -462,6 +553,11 @@ class LiveExecution:
             "allocations": [],
         }
         if step.kind == "trade":
+            quote_mark = (
+                money(self.broker.market("USDCUSDT", now)["bid"])
+                if step.quote_coin == "USDC"
+                else money(1)
+            )
             market = self.broker.market(step.symbol, now)
             price = money(market["ask" if step.side == "buy" else "bid"])
             if abs(price / step.reference_price - 1) > step.maximum_deviation:
@@ -481,10 +577,10 @@ class LiveExecution:
             # Market buys use quote units; market sells use base units.
             amount = rounded(amount / (1 + money(market["fee"])), decimals)
             notional = amount if step.side == "buy" else amount * price
-            if notional < money(market["minimum_notional"]):
+            if notional * quote_mark < money(market["minimum_notional"]):
                 raise ExecutionError("order_below_minimum")
             maximum_debit = amount * (1 + money(market["fee"]))
-            if maximum_debit > self.owned_spot(book)[step.input_coin]:
+            if maximum_debit > source_spot:
                 raise ExecutionError("strategy_funds_unavailable")
             levels = market["asks"] if step.side == "buy" else market["bids"]
             need = amount if step.side == "sell" else amount / price
@@ -502,7 +598,12 @@ class LiveExecution:
                 op["allocations"] = self.principal_sale_allocations(
                     book, step, market, amount, maximum_debit
                 )
-            op.update(amount=str(amount), maximum_debit=str(maximum_debit), market=market)
+            op.update(
+                amount=str(amount),
+                maximum_debit=str(maximum_debit),
+                market=market,
+                quote_mark=str(quote_mark),
+            )
             op["request"] = {
                 "symbol": step.symbol,
                 "side": step.side,
@@ -529,7 +630,20 @@ class LiveExecution:
                     money(terms["singleMaxAmount"]), money(terms["remainingAmount"])
                 ):
                     raise ExecutionError("subscription_terms_not_satisfied")
-                available = self.owned_spot(book)[step.coin]
+                if step.minimum_marginal_apr is not None:
+                    from freqtrade.strategy.trx_phase1.stablecoin_policy import minimum_apr
+
+                    held = sum(
+                        (
+                            money(p["amount"])
+                            for p in holdings.values()
+                            if p["product_id"] == step.product_id and p["coin"] == step.coin
+                        ),
+                        money(0),
+                    )
+                    if minimum_apr(terms, held, amount) < step.minimum_marginal_apr:
+                        raise ExecutionError("stablecoin_subscription_tier_changed")
+                available = source_spot
                 if step.source == "external_interest":
                     from freqtrade.strategy.trx_phase1.external_income_reinvestment import authorize
 
@@ -548,11 +662,11 @@ class LiveExecution:
             else:
                 if rule.redemption_minimum is None:
                     raise ExecutionError("redemption_terms_unverified")
-                if (
-                    amount < rule.redemption_minimum
-                    or rounded(amount, rule.redemption_decimals) != amount
-                ):
+                redeem_amount = rounded(amount, rule.redemption_decimals)
+                if amount < rule.redemption_minimum or redeem_amount != amount:
                     raise ExecutionError("redemption_terms_not_satisfied")
+                if step.coin in {"USDT", "USDC"}:
+                    amount = redeem_amount
                 owned = self.state["holdings"].get(step.holding_id)
                 remote = holdings.get(step.holding_id)
                 if (
@@ -561,10 +675,18 @@ class LiveExecution:
                     or owned["product_id"] != step.product_id
                     or remote["product_id"] != step.product_id
                     or remote["coin"] != step.coin
-                    or amount > money(owned[step.source])
+                    or amount > money(owned["unassigned_amount" if step.external else step.source])
                     or amount > money(remote["amount"])
                 ):
                     raise ExecutionError("owned_holding_unavailable")
+                if step.external:
+                    from freqtrade.strategy.trx_phase1.external_stablecoin import holding_amount
+
+                    if amount > holding_amount(owned) or money(remote["amount"]) != sum(
+                        (money(owned[k]) for k in ("principal", "interest", "unassigned_amount")),
+                        money(0),
+                    ):
+                        raise ExecutionError("external_stablecoin_holding_mismatch")
                 if step.redeem_lots and any(
                     q > money(owned.get("lots", {}).get(k, "0"))
                     for k, q in step.redeem_lots.items()
@@ -592,32 +714,54 @@ class LiveExecution:
         flow["status"] = "running"
         self.event("operation_prepared", now, operation_id=client_id)
 
-    def send(self, now):
+    def submission_preflight(self, now, clock):
         started = time.monotonic()
-        op, flow = self.state["operation"], self.state["flow"]
+        flow = self.state["flow"]
+        if clock:
+            now, _ = clock()
         if now >= flow["expires_at"]:
             self.state["operation"] = None
             flow["status"] = "expired"
             self.save()
-            return
+            return None
         # Refresh all preflight inputs immediately before a first submission.
         # No previous attempt exists in this branch; deterministic ID is retained.
         self.prepare(now)
         self.save()
         op = self.state["operation"]
-        if hasattr(self.broker, "reserve_submission"):
-            self.broker.reserve_submission(op, flow["expires_at"])
-        now += int((time.monotonic() - started) * 1000)
+        if clock:
+            now, exchange_now = clock()
+        else:
+            if hasattr(self.broker, "reserve_submission"):
+                self.broker.reserve_submission(op, flow["expires_at"])
+            now += int((time.monotonic() - started) * 1000)
+            exchange_now = now
         if now >= flow["expires_at"]:
             self.state["operation"] = None
             flow["status"] = "expired"
             self.event("flow_expired_during_preflight", now)
             self.save()
-            return
+            return None
         if op["kind"] == "trade":
-            if not -2000 <= now - op["market"]["timestamp"] <= 10000:
+            if not -2000 <= exchange_now - op["market"]["timestamp"] <= 10000:
                 raise ExecutionError("quote_expired_during_preflight")
-            op["request"]["requestTime"] = str(now)
+            op["request"]["requestTime"] = str(exchange_now)
+        if clock and hasattr(self.broker, "reserve_submission"):
+            self.broker.reserve_submission(op, flow["expires_at"])
+        return now
+
+    def send(self, now):
+        op = self.state["operation"]
+        # The strategy tick's observation time can precede funding and candle checks.
+        clock = (
+            getattr(self.broker, "submission_times", None)
+            if self.stablecoin_conversion(op["step"])
+            else None
+        )
+        now = self.submission_preflight(now, clock)
+        if now is None:
+            return
+        op, flow = self.state["operation"], self.state["flow"]
         op["created_at"] = now
         # Preflight freezes the deadline. The durable sending intent precedes
         # actual shared-rate admission and the first HTTP submission.
@@ -633,16 +777,39 @@ class LiveExecution:
         except WriteNotSent:
             op["status"] = "prepared"
             self.event("write_not_sent", now, operation_id=op["id"], code="request_rate_wait")
+            if clock:
+                flow_now, exchange_now = clock()
+                if exchange_now - op["market"]["timestamp"] >= 10000:
+                    self.defer_rebalance_quote(flow, "quote_expired_during_preflight", flow_now)
         except WriteRejected as exc:
             op["status"], flow["status"] = "rejected", "failed"
             self.event("write_rejected", now, code=str(exc), operation_id=op["id"])
             self.state["operation"] = None
+            if self.is_rebalance_redemption(op):
+                self.record_rebalance_redemption_failure(op, now, str(exc))
         except Exception:
             # Includes malformed successful acknowledgements. A POST may have
             # committed even when the local response cannot be parsed.
             op["status"] = "unknown"
             self.event("write_outcome_unknown", now, operation_id=op["id"])
         self.save()
+
+    def is_rebalance_redemption(self, op):
+        return (
+            op["kind"] == "redeem"
+            and self.state["flow"]["label"] == "C1 live · stablecoin_rebalance"
+        )
+
+    def record_rebalance_redemption_failure(self, op, now, code):
+        failure = {
+            "code": code,
+            "operation_id": op["id"],
+            "exchange_id": op["exchange_id"],
+            "timestamp": now,
+        }
+        self.state["flow"].update(status="failed", rebalance_redemption_failure=failure)
+        self.state["operation"] = None
+        self.event("stablecoin_rebalance_redemption_rejected", now, failure=failure)
 
     def reconcile(self, now):
         op = self.state["operation"]
@@ -684,7 +851,8 @@ class LiveExecution:
     def apply_fill(self, book, op, fill):
         step = ExecutionStep.model_validate(op["step"])
         base = SYMBOLS[step.symbol]
-        fees = {c: money(0) for c in (base, "USDT")}
+        quote_coin = step.quote_coin
+        fees = {c: money(0) for c in (base, quote_coin)}
         for fee in fill["fees"]:
             if fee["coin"] not in fees or money(fee["cost"]) < 0:
                 raise ExecutionError("native_fee_requires_reconciliation")
@@ -721,14 +889,31 @@ class LiveExecution:
                             allocation["quantity"] = str(
                                 money(allocation["quantity"]) - money(part["quantity"])
                             )
+        else:
+            self.apply_stable_fill(book, step, event_id, q, quote, fees, op.get("quote_mark", "1"))
+        sign = 1 if step.side == "buy" else -1
+        return {base: sign * q - fees[base], quote_coin: -sign * quote - fees[quote_coin]}
+
+    @staticmethod
+    def apply_stable_fill(book, step, event_id, q, quote, fees, quote_mark):
+        base = SYMBOLS[step.symbol]
+        quote_coin = step.quote_coin
+        if quote_coin == "USDC":
+            if step.side == "buy":
+                source, paid, received = "USDC", quote + fees["USDC"], q - fees[base]
+            else:
+                source, paid, received = "USDGO", q + fees[base], quote - fees["USDC"]
+            book.convert_stable_pair(event_id, source, paid, received, quote_mark)
+        elif base == "USDC":
+            if step.side == "buy":
+                book.convert(event_id, "to_usdc", quote + fees["USDT"], q - fees[base], quote / q)
+            else:
+                book.convert(event_id, "from_usdc", q + fees[base], quote - fees["USDT"], quote / q)
         elif step.side == "buy":
             book.convert(event_id, "to_usdgo", quote + fees["USDT"], q - fees[base], quote / q)
         else:
             book.convert(event_id, "to_usdt", q + fees[base], quote - fees["USDT"], quote / q)
-        if base == "USDGO":
-            book.fees += fees["USDT"] + fees[base] * (quote / q)
-        sign = 1 if step.side == "buy" else -1
-        return {base: sign * q - fees[base], "USDT": -sign * quote - fees["USDT"]}
+        book.fees += (fees[quote_coin] + fees[base] * (quote / q)) * money(quote_mark)
 
     def reconcile_trade(self, now):  # noqa: C901 - validate a whole receipt batch before commit
         op = self.state["operation"]
@@ -763,7 +948,8 @@ class LiveExecution:
             raise ExecutionError("order_status_unverified")
         candidate, candidate_op = Ledger.restore(self.state["book"]), deepcopy(op)
         receipts = dict(self.state["receipts"])
-        deltas = {c: money(0) for c in COINS}
+        quote_coin = step.quote_coin
+        deltas = {c: money(0) for c in (*COINS, SYMBOLS[step.symbol], quote_coin)}
         for fill in fills:
             key = "spot:" + order_id + ":" + fill["id"]
             fingerprint = digest(fill)
@@ -771,7 +957,7 @@ class LiveExecution:
                 raise ExecutionError("conflicting_fill_receipt")
             # Reconstruct aggregate settlement deltas from every receipt, but
             # apply each receipt to the principal ledger exactly once.
-            fees = {c: money(0) for c in (SYMBOLS[step.symbol], "USDT")}
+            fees = {c: money(0) for c in (SYMBOLS[step.symbol], quote_coin)}
             for fee in fill["fees"]:
                 if fee["coin"] not in fees or money(fee["cost"]) < 0:
                     raise ExecutionError("native_fee_requires_reconciliation")
@@ -780,12 +966,29 @@ class LiveExecution:
             deltas[SYMBOLS[step.symbol]] += (
                 sign * money(fill["quantity"]) - fees[SYMBOLS[step.symbol]]
             )
-            deltas["USDT"] += -sign * money(fill["quote"]) - fees["USDT"]
+            deltas[quote_coin] += -sign * money(fill["quote"]) - fees[quote_coin]
             if key not in receipts:
-                self.apply_fill(candidate, candidate_op, fill)
+                if not step.external:
+                    self.apply_fill(candidate, candidate_op, fill)
                 receipts[key] = fingerprint
         if -deltas[step.input_coin] > money(op["maximum_debit"]):
             raise ExecutionError("fill_exceeds_reserved_funds")
+        if step.external:
+            from freqtrade.strategy.trx_phase1.external_stablecoin import settle_trade
+
+            return settle_trade(
+                self,
+                step,
+                candidate_op,
+                order_id,
+                status,
+                fills,
+                receipts,
+                deltas,
+                base_total,
+                quote_total,
+                now,
+            )
         self.state["book"], self.state["receipts"] = candidate.state(), receipts
         candidate_op.update(
             exchange_id=order_id, fills={f["id"]: f for f in fills}, status="settling"
@@ -895,6 +1098,9 @@ class LiveExecution:
         step = ExecutionStep.model_validate(op["step"])
         result = self.broker.result(op["kind"], op["exchange_id"])
         if result.get("result") == "fail":
+            if self.is_rebalance_redemption(op):
+                self.reconcile_rebalance_redemption_failure(step, op, now)
+                return
             self.review("savings_result_failed_requires_wallet_review", now)
             return
         if result.get("result") != "success":
@@ -915,6 +1121,21 @@ class LiveExecution:
         expected = -amount if op["kind"] == "subscribe" else amount
         if not bills:
             return
+        if step.external or step.coin in {"USDT", "USDC"}:
+            kind = "SINGLE_USER_OUT" if step.kind == "subscribe" else "SINGLE_RELEASE_USER_IN"
+            bill_ids = [identifier(b["billId"]) for b in bills]
+            settled = {
+                bid
+                for e in self.state["events"]
+                if e["kind"] == "operation_settled"
+                for bid in e.get("bill_ids", [])
+            }
+            if (
+                any(b.get("businessType") != kind for b in bills)
+                or len(set(bill_ids)) != len(bill_ids)
+                or settled.intersection(bill_ids)
+            ):
+                raise ExecutionError("stablecoin_savings_bill_identity_unverified")
         if any(money(b["fees"]) != 0 for b in bills):
             raise ExecutionError("earn_fee_semantics_unverified")
         if sum((money(b["size"]) for b in bills), money(0)) != expected:
@@ -941,6 +1162,10 @@ class LiveExecution:
             from freqtrade.strategy.trx_phase1.external_income_reinvestment import settle
 
             return settle(self, step, op, bills, holdings, holding_id, now)
+        if step.external:
+            from freqtrade.strategy.trx_phase1.external_stablecoin import settle_earn
+
+            return settle_earn(self, step, op, bills, holdings, holding_id, now)
         candidate = Ledger.restore(self.state["book"])
         positions = deepcopy(self.state["holdings"])
         position = positions.setdefault(
@@ -990,12 +1215,29 @@ class LiveExecution:
         self.complete({"coin": step.coin, "amount": str(amount), "holding_id": holding_id}, now)
         self.save()
 
+    def reconcile_rebalance_redemption_failure(self, step, op, now):
+        bills = self.broker.bills(step.coin, max(0, op["created_at"] - 1000), now)
+        if (
+            any(str(b.get("bizOrderId")) == op["exchange_id"] for b in bills)
+            or self.broker.balances() != op["before_balances"]
+            or self.broker.holdings(self.state["created_at"] - 1000, now) != op["before_holdings"]
+        ):
+            self.review("savings_result_failed_requires_wallet_review", now)
+            return
+        self.record_rebalance_redemption_failure(op, now, "savings_redeem_result_failed")
+        self.save()
+
     @staticmethod
     def move_location(book, coin, amount, source, lot_allocations=None):
         moved_lots = {}
-        if coin != "TRX":
+        if coin == "USDC":
+            book.usdc_locked += amount
+            if not 0 <= book.usdc_locked <= book.usdc:
+                raise ExecutionError("savings_location_mismatch")
+        elif coin in {"USDT", "USDGO"}:
             book.locked[coin] += amount
-            if not 0 <= book.locked[coin] <= book.usdgo:
+            total = book.cash if coin == "USDT" else book.usdgo
+            if not 0 <= book.locked[coin] <= total:
                 raise ExecutionError("savings_location_mismatch")
         elif source == "interest":
             book.locked["TRX_INTEREST"] += amount
@@ -1068,11 +1310,22 @@ class LiveExecution:
         book, positions = Ledger.restore(book.state()), deepcopy(positions)
         receipts = dict(receipts)
         income_records, grouped, used_bills = [], {}, set()
-        bills_by_coin = {c: self.broker.bills(c, start, now) for c in ("TRX", "USDGO")}
-        for coin in ("TRX", "USDGO"):
+        policy = self.stablecoin_policy
+        coins = ("TRX", "USDGO", "USDC", "USDT") if policy else ("TRX", "USDGO")
+        bills_by_coin = {
+            coin: self.broker.bills(
+                coin,
+                min(now, max(start, policy["starts_at"])) if coin in {"USDC", "USDT"} else start,
+                now,
+            )
+            for coin in coins
+        }
+        for coin in coins:
             records = (
                 self.broker.savings_records(coin, start, now, order_type="pay_interest")
-                if positions and not self.state.get("performance_basis")
+                if coin in {"TRX", "USDGO"}
+                and positions
+                and not self.state.get("performance_basis")
                 else []
             )
             for row in records:
@@ -1221,12 +1474,38 @@ class LiveExecution:
                 ):
                     continue
                 bill = self.interest_bill(raw)
+                if coin in {"USDT", "USDC"} and (
+                    "account-credit:" + bill["bill_id"] in receipts
+                    or bill["bill_id"] in self.state.get("account_movement_bill_receipts", {})
+                ):
+                    continue
                 if bill["coin"] != coin or not self.state["created_at"] <= bill["timestamp"] <= now:
                     raise ExecutionError("invalid_interest_bill")
                 amount = money(bill["amount"])
                 if amount <= 0 or money(bill["fees"]) != 0:
                     raise ExecutionError("invalid_interest_bill")
                 fingerprint = digest(bill)
+                if coin in {"USDT", "USDC"} and policy:
+                    hour = 3600000
+                    if bill["timestamp"] // hour * hour - hour < policy["starts_at"]:
+                        # Before the first full accrual hour under this policy,
+                        # these coins had no eligible strategy-owned Earn slice.
+                        key = "account-credit:" + bill["bill_id"]
+                        if key not in receipts:
+                            receipts[key] = fingerprint
+                            income_records.append(
+                                (
+                                    key,
+                                    {
+                                        **bill,
+                                        "destination": "spot",
+                                        "attribution": "external_account_credit",
+                                        "offset_delta": str(amount),
+                                        "reason": "stablecoin_first_full_hour_pending",
+                                    },
+                                )
+                            )
+                        continue
                 baseline = self.state.get("income_baseline_bills", {})
                 if bill["bill_id"] in baseline:
                     if baseline[bill["bill_id"]] != fingerprint:
@@ -1275,6 +1554,8 @@ class LiveExecution:
 
     def income_adjustments(self, income_records):
         offsets = dict(self.state["unassigned_offsets"])
+        if self.stablecoin_policy:
+            offsets.setdefault("USDC", self.state["external_usdc"]["spot"])
         pending = deepcopy(self.state.get("pending_income", {}))
         for key, credit in income_records:
             coin = credit["coin"]
@@ -1297,6 +1578,8 @@ class LiveExecution:
         )
         if accounting is not None:
             self.state["income_accounting"] = accounting
+        if self.stablecoin_policy:
+            self.state["external_usdc"]["spot"] = offsets["USDC"]
         for key, credit in income_records:
             if credit.get("attribution") == "external_account_credit":
                 self.state.setdefault("quarantined_account_credits", {})[key] = credit

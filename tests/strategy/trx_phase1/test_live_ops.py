@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from freqtrade.strategy.trx_phase1 import live_backup, live_ops
+from freqtrade.strategy.trx_phase1.ledger import Ledger
 from freqtrade.strategy.trx_phase1.live_ops import LiveView, Operations, ViewUnavailable
 from freqtrade.strategy.trx_phase1.live_ops_app import create_app
 from tests.strategy.trx_phase1.test_live_strategy import live, startup  # noqa: F401
@@ -53,6 +54,68 @@ def test_view_is_read_only_and_has_no_worker_or_curve_and_preserves_accounting(o
     with pytest.raises(ViewUnavailable):
         live_ops.read_state(missing, "execution")
     assert not missing.exists()
+
+
+def test_view_includes_only_strategy_usdc_and_reconciles_its_mark_to_market(observed, monkeypatch):
+    _, broker, view = observed
+    ev, sv, execution, state = view.snapshot()
+    book = Ledger.restore(execution["book"])
+    book.credit_interest("income-allocation:usdc", "USDC", "25", "1")
+    execution["book"] = book.state()
+    execution.setdefault("unassigned_offsets", {})["USDC"] = "500"
+    state["markets"]["USDCUSDT"] = {"bid": "1.01", "timestamp": broker.now}
+    monkeypatch.setattr(view, "snapshot", lambda: (ev, sv, execution, state))
+
+    result = view.view()["runtime"]
+    assert result["summary"]["usdc_market_value"] == 25.25
+    dashboard = result["dashboard"]
+    location = next(row for row in dashboard["locations"] if row["coin"] == "USDC")
+    assert location["total"] == "25"
+    assert location["outside_strategy"] == "500"
+    assert dashboard["attribution"]["usdc_unrealized"] == "0.25"
+    assert dashboard["attribution"]["reconciled"]
+
+
+def test_activity_reports_booked_usdc_and_batched_usdt_interest():
+    now = int(datetime(2026, 11, 4, 10, 16, tzinfo=UTC).timestamp() * 1000)
+    book = Ledger(1000)
+    book.credit_interest("income-allocation:usdc", "USDC", "0.33763838", "1")
+    book.credit_interest("income-product-batch:usdt", "USDT", "0.01369862")
+    execution = {
+        "book": book.state(),
+        "created_at": now - 3600000,
+        "income_accounting": {
+            "allocations": {
+                "income-bill:usdc": {
+                    "bill_id": "usdc",
+                    "coin": "USDC",
+                    "amount": "0.33763838",
+                    "timestamp": now,
+                },
+                "income-product-batch:usdt": {
+                    "bill_id": "usdt",
+                    "coin": "USDT",
+                    "amount": "0.01369862",
+                    "timestamp": now,
+                },
+                "income-product-batch:outside": {
+                    "bill_id": "outside",
+                    "coin": "USDT",
+                    "amount": "0",
+                    "external_amount": "0.00031476",
+                    "timestamp": now,
+                },
+            },
+        },
+    }
+    activity = live_ops.activity_summary(execution, now)
+    assert activity["complete"]["interest"]
+    assert activity["periods"]["today"]["interest"] == {
+        "TRX": "0",
+        "USDGO": "0",
+        "USDT": "0.01369862",
+        "USDC": "0.33763838",
+    }
 
 
 def test_unused_adopted_account_can_poll_without_market_fees_or_starting_trading(tmp_path):
@@ -695,6 +758,156 @@ def test_backup_timeout_retains_last_success_without_touching_source(
     status = json.loads(Path(config["status"]).read_text())
     assert status["last_success_at"] == 1234
     assert status["last_error"] == "TimeoutError"
+    assert not list(Path(config["destination"]).glob("*.tar.gz"))
+
+
+@pytest.fixture
+def backup_for_timeout_checks(observed, tmp_path):
+    config = backup_config(observed, tmp_path)
+    result = live_backup.run_backup(config)
+    directory = tmp_path / "isolated-timeout-check"
+    directory.mkdir()
+    live_backup.unpack_archive(Path(config["destination"]) / result["last_archive"], directory)
+    with closing(sqlite3.connect(directory / "execution.sqlite")) as db, db:
+        # Ensure quick_check runs enough VM instructions to invoke its real
+        # SQLite progress handler, without changing the source databases.
+        db.execute("CREATE TABLE timeout_payload (payload TEXT)")
+        db.executemany("INSERT INTO timeout_payload VALUES (?)", [("data",)] * 5000)
+    return directory, config["account_id"]
+
+
+def test_backup_verification_can_finish_after_old_twenty_second_limit(
+    backup_for_timeout_checks, monkeypatch
+):
+    directory, account = backup_for_timeout_checks
+    ticks = iter([100.0, 121.0])
+    monkeypatch.setattr(
+        live_backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: next(ticks, 121.0), process_time=live_backup.time.process_time
+        ),
+    )
+    checks = []
+    assert live_backup.verify(directory, account, checks=checks)["startup_complete"]
+    assert checks[0]["database"] == "execution"
+    assert checks[0]["wall_seconds"] == 21
+
+
+@pytest.mark.parametrize("deadline,elapsed", [(None, 61.0), (110.0, 21.0)])
+def test_backup_verification_keeps_per_database_and_total_deadlines(
+    backup_for_timeout_checks, monkeypatch, deadline, elapsed
+):
+    directory, account = backup_for_timeout_checks
+    ticks = iter([100.0, 100.0 + elapsed])
+    monkeypatch.setattr(
+        live_backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: next(ticks, 100.0 + elapsed),
+            process_time=live_backup.time.process_time,
+        ),
+    )
+    checks = []
+    with pytest.raises(TimeoutError, match="backup_database_check_timeout:execution"):
+        live_backup.verify(directory, account, deadline=deadline, checks=checks)
+    assert checks[0]["database"] == "execution"
+    assert checks[0]["wall_seconds"] == elapsed
+
+
+def test_archived_backup_timeout_records_stage_and_retains_last_success(
+    observed, tmp_path, monkeypatch
+):
+    config = backup_config(observed, tmp_path)
+    Path(config["status"]).write_text(json.dumps({"last_success_at": 1234}))
+    source = Path(config["source"])
+    before = {p.name: p.read_bytes() for p in source.glob("*.sqlite")}
+    verify = live_backup.verify
+
+    def timeout_on_readback(directory, account, **kwargs):
+        if Path(directory).name.startswith(".trx-check-"):
+            raise TimeoutError("backup_database_check_timeout:strategy")
+        return verify(directory, account, **kwargs)
+
+    monkeypatch.setattr(live_backup, "verify", timeout_on_readback)
+    with pytest.raises(TimeoutError, match="backup_database_check_timeout:strategy"):
+        live_backup.run_backup(config)
+    status = json.loads(Path(config["status"]).read_text())
+    assert status["last_success_at"] == 1234
+    assert status["last_error_stage"] == "archived_database_verification"
+    assert status["last_error_message"] == "backup_database_check_timeout:strategy"
+    assert len(status["last_attempt_database_checks"]["copied"]) == 2
+    assert not list(Path(config["destination"]).glob("*.tar.gz"))
+    assert {p.name: p.read_bytes() for p in source.glob("*.sqlite")} == before
+
+
+def test_backup_verification_still_rejects_corrupt_database(backup_for_timeout_checks):
+    directory, account = backup_for_timeout_checks
+    (directory / "execution.sqlite").write_bytes(b"invalid SQLite database")
+    with pytest.raises(sqlite3.DatabaseError, match="file is not a database"):
+        live_backup.verify(directory, account)
+
+
+def test_backup_accepts_updates_completed_during_large_strategy_copy(
+    observed, tmp_path, monkeypatch
+):
+    config = backup_config(observed, tmp_path)
+    source = Path(config["source"])
+    copy_database = live_backup.copy_database
+    copies = []
+
+    def copy_with_worker_update(path, destination, deadline):
+        if Path(path).name == "strategy.sqlite":
+            # Simulate a normal worker completing its writes before the large
+            # database's SQLite backup snapshot is established.
+            for name in ("execution", "strategy"):
+                with closing(sqlite3.connect(source / (name + ".sqlite"))) as db, db:
+                    db.execute("UPDATE trx_state SET version=version+1 WHERE id=?", (name,))
+            copies.append(True)
+        copy_database(path, destination, deadline)
+
+    monkeypatch.setattr(live_backup, "copy_database", copy_with_worker_update)
+    result = live_backup.run_backup(config)
+    restore = tmp_path / "isolated-copy"
+    restore.mkdir()
+    live_backup.unpack_archive(Path(config["destination"]) / result["last_archive"], restore)
+    for name in ("execution", "strategy"):
+        assert live_backup.state(restore / (name + ".sqlite"), name) == live_backup.state(
+            source / (name + ".sqlite"), name
+        )
+    assert len(copies) == 1
+    assert result["last_error"] is None
+
+
+@pytest.mark.parametrize("changed", ["execution", "strategy", "control"])
+def test_backup_rejects_changes_across_execution_copy(observed, tmp_path, monkeypatch, changed):
+    config = backup_config(observed, tmp_path)
+    Path(config["status"]).write_text(json.dumps({"last_success_at": 1234}))
+    copy_database = live_backup.copy_database
+    changes = []
+
+    def copy_with_concurrent_change(path, destination, deadline):
+        copy_database(path, destination, deadline)
+        if Path(path).name != "execution.sqlite":
+            return
+        changes.append(True)
+        if changed == "control":
+            control = Path(config["control"])
+            value = json.loads(control.read_text())
+            value["concurrent_change"] = len(changes)
+            control.write_text(json.dumps(value))
+        else:
+            database = Path(config["source"]) / (changed + ".sqlite")
+            with closing(sqlite3.connect(database)) as db, db:
+                db.execute("UPDATE trx_state SET version=version+1 WHERE id=?", (changed,))
+
+    monkeypatch.setattr(live_backup, "copy_database", copy_with_concurrent_change)
+    with pytest.raises(ValueError, match="backup_source_changed_retry_later"):
+        live_backup.run_backup(config)
+    assert len(changes) == 3
+    status = json.loads(Path(config["status"]).read_text())
+    assert status["last_success_at"] == 1234
+    assert status["last_error"] == "ValueError"
     assert not list(Path(config["destination"]).glob("*.tar.gz"))
 
 
