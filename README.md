@@ -12,7 +12,7 @@ TRX 策略专用后端，包含 Bitget 现货实盘执行、独立批次账本�
 flowchart LR
     Browser["浏览器"] -->|HTTPS| Gateway["Caddy 网关"]
     Gateway -->|静态页面与资源| Frontend["独立前端"]
-    Gateway -->|交易与研究接口| Trading["交易 API · 8080<br/>单个实盘 worker"]
+    Gateway -->|交易与研究接口| Trading["交易 API · 8088<br/>单个实盘 worker"]
     Gateway -->|view / ops| Observer["独立监控 · 8091"]
     Gateway -->|history| History["历史服务 · 8090"]
     Trading -->|交易、理财与回执核对| Bitget["Bitget Classic"]
@@ -38,7 +38,7 @@ flowchart LR
 | --- | --- |
 | `/api/v1/trx/live/view`、`/api/v1/trx/live/ops` | 独立监控，8091 |
 | `/api/v1/trx/live/history` | 独立历史，8090 |
-| 其他 `/api/v1/*` | 交易及研究 API，8080 |
+| 其他 `/api/v1/*` | 交易及研究 API，8088 |
 
 三个服务使用同一网站 `username` 和 `jwt_secret_key`。`GET /api/v1/ping` 是公开健康检查；`POST /api/v1/token/login` 使用 HTTP Basic 返回 access/refresh token，`POST /api/v1/token/refresh` 刷新访问令牌。交易及研究接口接受 HTTP Basic 或 access token，独立监控与历史接口使用 access token。接口文档默认关闭，可设置 `api_server.enable_openapi: true` 后查看 `/docs`。
 
@@ -84,7 +84,7 @@ cp config_examples/server.example.json user_data/config.trx.json
 .venv/bin/trx-server --config user_data/config.trx.json
 ```
 
-配置示例监听 `0.0.0.0:8080`；本机专用时可改为 `127.0.0.1`。生产环境使用 HTTPS 反向代理；前后端跨域时，在 `CORS_origins` 中填写实际前端来源。
+配置示例监听 `0.0.0.0:8088`；本机专用时可改为 `127.0.0.1`。生产环境使用 HTTPS 反向代理；前后端跨域时，在 `CORS_origins` 中填写实际前端来源。
 
 默认 `existing_live_only: true`、`auto_resume_live: false`。首次启动不会自动创建或启动实盘账户。实盘准备、复核和启动继续使用原有 TRX 接口与 review hash 流程。交易进程只运行一个 worker；不要并行启动多个实例操作同一账户。
 
@@ -98,7 +98,7 @@ cp config_examples/server.example.json user_data/config.trx.json
 docker compose up --build -d
 ```
 
-仓库中的 `docker-compose.yml` 提供本地交易 API 示例，只在宿主机 `127.0.0.1:8080` 发布端口，容器内存及 memory+swap 上限均为 512 MiB。线上沿用三个独立 Compose 文件、既有数据挂载和上方列出的资源限制；本地示例不包含完整生产部署。
+仓库中的 `docker-compose.yml` 提供本地交易 API 示例，交易进程监听 `8088`，只在宿主机 `127.0.0.1:8088` 发布。容器内存及 memory+swap 上限均为 512 MiB。线上沿用三个独立 Compose 文件、既有数据挂载和上方列出的资源限制；本地示例不包含完整生产部署。
 
 ### 线上服务入口
 
@@ -169,7 +169,7 @@ systemctl is-active trx-phase1-backup.timer \
   trx-phase1-rebate-capital.timer trx-phase1-resources.timer
 ```
 
-`8088` 是线上交易 API 的宿主机回环端口，容器内仍为 `8080`。登录后通过 `/api/v1/trx/live` 检查 `runtime` 中的 `worker_running`、`desired`、`phase` 和错误字段；通过只读监控与历史接口核对心跳、分钟线、资金位置、收益对账、告警及历史记录。历史查询需携带当前账户的 `account_id`。
+交易 API 监听 `8088`。登录后通过 `/api/v1/trx/live` 检查 `runtime` 中的 `worker_running`、`desired`、`phase` 和错误字段；通过只读监控与历史接口核对心跳、分钟线、资金位置、收益对账、告警及历史记录。历史查询需携带当前账户的 `account_id`。
 
 | 现象 | 检查与处理 |
 | --- | --- |

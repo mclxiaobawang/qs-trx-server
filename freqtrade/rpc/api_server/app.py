@@ -120,7 +120,7 @@ def main(argv=None):
     uvicorn.run(
         app,
         host=api.get("listen_ip_address", "127.0.0.1"),
-        port=api.get("listen_port", 8080),
+        port=api.get("listen_port", 8088),
         workers=1,
         limit_concurrency=api.get("limit_concurrency", 8),
         log_config=log_config,

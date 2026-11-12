@@ -9,7 +9,8 @@ from freqtrade.strategy.trx_phase1 import live_ops
 
 
 @pytest.mark.parametrize(
-    "label,domain", [("Max", "trx.octo-agent.com"), ("齿轮", "trxqs.octo-agent.com")]
+    "label,domain",
+    [("Max", "trx.octo-agent.com"), ("齿轮", "trxqs.octo-agent.com"), ("XBW", "xbw-apr.shop")],
 )
 @pytest.mark.parametrize(
     "transition,item",

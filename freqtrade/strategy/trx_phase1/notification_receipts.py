@@ -46,7 +46,7 @@ def format_notification(config, subject, body):
             or not label.strip()
             or len(label) > 32
             or any(c in label for c in "\r\n【】")
-            or domain not in {"trx.octo-agent.com", "trxqs.octo-agent.com"}
+            or domain not in {"trx.octo-agent.com", "trxqs.octo-agent.com", "xbw-apr.shop"}
         ):
             raise ValueError("notification_source_invalid")
         subject = f"【{label}｜{domain}】" + subject
